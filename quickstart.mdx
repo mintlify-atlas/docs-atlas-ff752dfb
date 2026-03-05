@@ -1,80 +1,461 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Get up and running with microMLC in 10 minutes"
 ---
 
-## Get started in three steps
+# Quickstart Guide
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+This guide will take you from zero to running your first optimized compiler pass on a transformer attention workload. You'll build the complete toolchain, sync custom passes, and execute the full optimization pipeline.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+**Prerequisites**: macOS or Linux with CMake 3.13+, Ninja, Python 3.8+, and at least 20GB of free disk space for the build artifacts.
 </Note>
+
+## Installation
+
+<Steps>
+  <Step title="Clone the repository">
+    Start by cloning the microMLC repository:
+
+    ```bash
+    git clone https://github.com/sakshambatra1/microMLC.git
+    cd microMLC
+    ```
+  </Step>
+
+  <Step title="Clone StableHLO and LLVM">
+    microMLC builds on top of StableHLO v0.13.0 and LLVM 18.1.8. Clone them into the `third_party` directory:
+
+    ```bash
+    mkdir -p third_party
+    
+    # Clone StableHLO at specific commit
+    git clone https://github.com/openxla/stablehlo.git third_party/stablehlo
+    git -C third_party/stablehlo checkout 75c7095a97c6aaaee15dfab1fac529ce695e1d4a
+    
+    # Clone LLVM/MLIR at specific commit
+    git clone https://github.com/llvm/llvm-project.git third_party/stablehlo/llvm-project
+    git -C third_party/stablehlo/llvm-project checkout 3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff
+    ```
+
+    <Warning>
+    These specific commits are tested and known to work together. Using different versions may cause build failures.
+    </Warning>
+  </Step>
+
+  <Step title="Sync custom passes">
+    Copy microMLC's custom MLIR passes into the StableHLO source tree:
+
+    ```bash
+    bash tools/sync_passes.sh
+    ```
+
+    This copies the following passes from `passes/` into `third_party/stablehlo/stablehlo/transforms/`:
+
+    - `TilingPass.cpp` - Converts StableHLO to Linalg with initial tiling
+    - `GenericFusionPass.cpp` - Fuses adjacent Linalg generic operations
+    - `LinalgTilingPass.cpp` - Multi-level cache-aware tiling (L2/L1)
+    - `OneShotBufferizePass.cpp` - Tensor-to-memref bufferization
+    - `ToyVectorizationPass.cpp` - SIMD vectorization with configurable vector width
+    - `ParallelSchedulingPassAttn.cpp` - Parallel scheduling for attention
+  </Step>
+
+  <Step title="Build LLVM and MLIR">
+    Build the LLVM/MLIR toolchain with Ninja (this takes 30-60 minutes):
+
+    ```bash
+    cmake -S third_party/stablehlo/llvm-project/llvm \
+      -B third_party/stablehlo/llvm-project/build \
+      -G Ninja \
+      -DLLVM_ENABLE_PROJECTS=mlir \
+      -DLLVM_TARGETS_TO_BUILD=host \
+      -DCMAKE_BUILD_TYPE=Release
+    
+    cmake --build third_party/stablehlo/llvm-project/build
+    ```
+
+    <Tip>
+    Use `-j$(nproc)` with ninja to parallelize the build. Set `DCMAKE_BUILD_TYPE=RelWithDebInfo` if you need debug symbols.
+    </Tip>
+  </Step>
+
+  <Step title="Build stablehlo-opt">
+    Build the StableHLO optimizer tool with the custom passes:
+
+    ```bash
+    cmake -S third_party/stablehlo \
+      -B third_party/stablehlo/build \
+      -G Ninja \
+      -DMLIR_DIR=third_party/stablehlo/llvm-project/build/lib/cmake/mlir \
+      -DLLVM_DIR=third_party/stablehlo/llvm-project/build/lib/cmake/llvm \
+      -DCMAKE_BUILD_TYPE=Release
+    
+    cmake --build third_party/stablehlo/build -t stablehlo-opt
+    ```
+
+    The resulting binary will be at `third_party/stablehlo/build/bin/stablehlo-opt`.
+  </Step>
+
+  <Step title="Install runtime dependencies">
+    Install LLVM 17 for the runtime libraries needed by `mlir-cpu-runner`:
+
+    <CodeGroup>
+    ```bash macOS
+    brew install llvm@17
+    ```
+
+    ```bash Ubuntu/Debian
+    sudo apt-get install llvm-17 llvm-17-dev llvm-17-runtime
+    ```
+
+    ```bash Fedora/RHEL
+    sudo dnf install llvm17 llvm17-devel
+    ```
+    </CodeGroup>
+  </Step>
+</Steps>
+
+## Running Your First Pass
+
+Now that the toolchain is built, let's run a complete optimization pipeline on a transformer attention workload.
+
+### Understanding the Input
+
+The starter IR file `ir/attn_complete.mlir` contains a complete attention mechanism implementation with:
+
+- **Linear projections**: Q, K, V matrix multiplications (128x128)
+- **Attention computation**: Scaled dot-product attention
+- **Multi-head structure**: 4 attention heads with 32-dimensional head size
+- **StableHLO + Linalg operations**: High-level operations ready for optimization
+
+Here's a snippet from `ir/attn_complete.mlir:20`:
+
+```mlir
+func.func public @main(%arg0: tensor<1x128x128xf32>, 
+                       %arg1: tensor<1x128x128xf32>, 
+                       %arg2: tensor<1x128x128xf32>, 
+                       %arg3: tensor<1x128x128xf32>) -> tensor<1x128x128xf32> {
+  
+  %cst_0 = arith.constant 0.000000e+00 : f32
+  %cst_neg_inf = arith.constant 0xFF800000 : f32
+  %cst_scale = arith.constant 0.176776695 : f32 
+  
+  // Linear projections Q, K, V
+  %q_proj = linalg.matmul ins(%in_flat, %w_q_flat : tensor<128x128xf32>, tensor<128x128xf32>) 
+                          outs(%init_proj : tensor<128x128xf32>) -> tensor<128x128xf32>
+  // ... more operations
+}
+```
+
+### Run the Full Pipeline
+
+Execute the complete optimization pipeline with a single command:
+
+```bash
+bash tools/run_attn_cache_pipeline.sh
+```
+
+This script runs the following stages sequentially:
+
+<Steps>
+  <Step title="Stage 0: StableHLO to Linalg">
+    Converts StableHLO operations to Linalg generic operations:
+
+    ```bash
+    stablehlo-opt ir/attn_complete.mlir \
+      -stablehlo-tiling \
+      -canonicalize -cse \
+      -o ir/attn_stage0_linalg.mlir
+    ```
+
+    **Output**: `ir/attn_stage0_linalg.mlir` - Linalg operations ready for fusion
+  </Step>
+
+  <Step title="Stage 1: Generic Fusion">
+    Fuses adjacent Linalg operations to reduce intermediate buffers:
+
+    ```bash
+    stablehlo-opt ir/attn_stage0_linalg.mlir \
+      -generic-fusion \
+      -canonicalize -cse \
+      -o ir/attn_stage1_fused.mlir
+    ```
+
+    **Output**: `ir/attn_stage1_fused.mlir` - Fused epilogue operations
+    
+    The fusion pass combines producer-consumer chains. For example, a matmul followed by element-wise operations gets fused into a single kernel.
+  </Step>
+
+  <Step title="Stage 2: Multi-Level Tiling">
+    Applies cache-aware tiling at L2 (64x64x64) and L1 (4x4x4) levels:
+
+    ```bash
+    stablehlo-opt ir/attn_stage1_fused.mlir \
+      "-stablehlo-linalg-tiling=l2-tile-sizes=64,64,64 l1-tile-sizes=4,4,4 enable-promotion=false" \
+      -canonicalize -cse \
+      -o ir/attn_stage2_tiled_tensor.mlir
+    ```
+
+    **Output**: `ir/attn_stage2_tiled_tensor.mlir` - Nested loops with tiled computation
+
+    **L2 tiles (64x64x64)**: Fit in L2 cache (~256KB)  
+    **L1 tiles (4x4x4)**: Fit in L1 cache and enable vectorization
+  </Step>
+
+  <Step title="Stage 3: Bufferization">
+    Converts tensor operations to explicit memref operations:
+
+    ```bash
+    stablehlo-opt ir/attn_stage2_tiled_tensor.mlir \
+      -empty-tensor-to-alloc-tensor \
+      "-one-shot-bufferize=bufferize-function-boundaries allow-return-allocs" \
+      -convert-bufferization-to-memref \
+      -canonicalize -cse \
+      -o ir/attn_stage3_bufferized.mlir
+    ```
+
+    **Output**: `ir/attn_stage3_bufferized.mlir` - Explicit memory allocations and loads/stores
+
+    This transformation enables low-level optimizations by making memory access patterns explicit.
+  </Step>
+
+  <Step title="Stage 5: Vectorization">
+    Generates SIMD vector instructions with vector width 4:
+
+    ```bash
+    stablehlo-opt ir/attn_stage3_bufferized.mlir \
+      "-toy-vectorize=vector-width=4 enable-reductions" \
+      -canonicalize -cse \
+      -o ir/attn_stage5_vectorized.mlir
+    ```
+
+    **Output**: `ir/attn_stage5_vectorized.mlir` - SIMD-optimized code ready for execution
+
+    The vectorizer converts scalar operations into vector operations that execute in parallel on modern CPUs (SSE, AVX, NEON).
+  </Step>
+</Steps>
+
+### Verify the Output
+
+After the pipeline completes, you should see:
+
+```bash
+Pipeline completed. Outputs:
+  ir/attn_stage0_linalg.mlir
+  ir/attn_stage1_fused.mlir
+  ir/attn_stage2_tiled_tensor.mlir
+  ir/attn_stage3_bufferized.mlir
+  ir/attn_stage5_vectorized.mlir
+```
+
+Inspect any stage to see the intermediate representation:
+
+```bash
+# View the tiled IR
+cat ir/attn_stage2_tiled_tensor.mlir | head -n 50
+
+# View the vectorized IR
+cat ir/attn_stage5_vectorized.mlir | head -n 50
+```
+
+## Running Individual Passes
+
+You can also run passes individually with custom parameters. This is useful for experimentation and debugging.
+
+### Example: Custom Tiling Sizes
+
+Try different tile sizes to optimize for your target hardware:
+
+```bash
+# Larger L2 tiles for systems with more L2 cache
+third_party/stablehlo/build/bin/stablehlo-opt \
+  ir/attn_stage1_fused.mlir \
+  "-stablehlo-linalg-tiling=l2-tile-sizes=128,128,128 l1-tile-sizes=8,8,8" \
+  -canonicalize -cse \
+  -o /tmp/custom_tiled.mlir
+```
+
+### Example: Fusion Only
+
+Run just the fusion pass to see how operations are combined:
+
+```bash
+third_party/stablehlo/build/bin/stablehlo-opt \
+  ir/attn_stage0_linalg.mlir \
+  -generic-fusion \
+  -o /tmp/fused_only.mlir
+```
+
+### Example: Custom Vector Width
+
+Adjust vector width based on your CPU's SIMD capabilities:
+
+```bash
+# Vector width 8 for AVX2
+third_party/stablehlo/build/bin/stablehlo-opt \
+  ir/attn_stage3_bufferized.mlir \
+  "-toy-vectorize=vector-width=8 enable-reductions" \
+  -o /tmp/avx2_vectorized.mlir
+
+# Vector width 16 for AVX-512
+third_party/stablehlo/build/bin/stablehlo-opt \
+  ir/attn_stage3_bufferized.mlir \
+  "-toy-vectorize=vector-width=16 enable-reductions" \
+  -o /tmp/avx512_vectorized.mlir
+```
+
+## Benchmarking Performance
+
+Measure the impact of your optimizations with the built-in benchmarking tools.
+
+### Benchmark All Stages
+
+Run benchmarks for all pipeline stages (100 iterations each):
+
+```bash
+ITERS=100 bash tools/benchmark_all_stages.sh
+```
+
+This compares the baseline unoptimized IR against each optimization stage and reports execution times.
+
+### Benchmark Final Stage
+
+Run a quick benchmark of just the fully optimized (vectorized) stage:
+
+```bash
+bash tools/benchmark_stage5.sh
+```
+
+This script:
+
+1. Adds a driver function to call `@main` with allocated inputs
+2. Lowers the IR through the full compilation stack to LLVM IR
+3. Runs `mlir-cpu-runner` with optimization level O3
+4. Reports execution time and validates correctness
+
+<Tip>
+The benchmark scripts use `mlir-cpu-runner` from LLVM 17. Make sure it's in your PATH or adjust the `RUNNER_BIN` variable in the scripts.
+</Tip>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Understand the Pipeline"
+    icon="diagram-project"
+    href="/architecture/pipeline"
+  >
+    Deep dive into each optimization stage and IR transformation
+  </Card>
+  <Card
+    title="Explore Custom Passes"
+    icon="gears"
+    href="/passes/overview"
+  >
+    Learn how each pass works and how to modify them
+  </Card>
+  <Card
+    title="Modify Passes"
+    icon="code"
+    href="/development/custom-passes"
+  >
+    Develop your own optimization passes
+  </Card>
+  <Card
+    title="Optimize Performance"
+    icon="gauge-high"
+    href="/usage/benchmarking"
+  >
+    Advanced benchmarking and performance tuning
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Build fails with 'stablehlo-opt not found'">
+    Make sure you've completed step 5 (Build stablehlo-opt) and the binary exists:
+
+    ```bash
+    ls -lh third_party/stablehlo/build/bin/stablehlo-opt
+    ```
+
+    If missing, rebuild:
+
+    ```bash
+    cmake --build third_party/stablehlo/build -t stablehlo-opt
+    ```
+  </Accordion>
+
+  <Accordion title="Pipeline fails with 'Input MLIR missing'">
+    The input file `ir/attn_complete.mlir` must exist. Verify:
+
+    ```bash
+    ls -lh ir/attn_complete.mlir
+    ```
+
+    If missing, you may need to generate it using the Python transformer code in `transformer/python/`.
+  </Accordion>
+
+  <Accordion title="Benchmark fails with 'mlir-cpu-runner not found'">
+    Ensure LLVM 17 runtime tools are installed and in your PATH:
+
+    ```bash
+    # macOS
+    export PATH="/opt/homebrew/opt/llvm@17/bin:$PATH"
+
+    # Linux (adjust path based on your installation)
+    export PATH="/usr/lib/llvm-17/bin:$PATH"
+    ```
+
+    Verify the runner exists:
+
+    ```bash
+    which mlir-cpu-runner
+    mlir-cpu-runner --version
+    ```
+  </Accordion>
+
+  <Accordion title="Pass synchronization fails">
+    If `sync_passes.sh` reports missing files, ensure you're in the repository root:
+
+    ```bash
+    cd /path/to/micromlc
+    bash tools/sync_passes.sh
+    ```
+
+    After syncing passes, you must rebuild stablehlo-opt:
+
+    ```bash
+    cmake --build third_party/stablehlo/build -t stablehlo-opt
+    ```
+  </Accordion>
+
+  <Accordion title="Different optimization results than expected">
+    Make sure you're using the exact StableHLO and LLVM commits specified in the setup:
+
+    ```bash
+    # Check StableHLO commit
+    git -C third_party/stablehlo rev-parse HEAD
+    # Should be: 75c7095a97c6aaaee15dfab1fac529ce695e1d4a
+
+    # Check LLVM commit
+    git -C third_party/stablehlo/llvm-project rev-parse HEAD
+    # Should be: 3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff
+    ```
+
+    If they don't match, checkout the correct commits and rebuild.
+  </Accordion>
+</AccordionGroup>
+
+## What You've Learned
+
+You now have a working microMLC installation and have run your first complete optimization pipeline. You've:
+
+- Built the MLIR/LLVM toolchain from source
+- Integrated custom compiler passes into StableHLO
+- Executed a multi-stage optimization pipeline on transformer attention
+- Generated optimized, vectorized code ready for execution
+- Benchmarked the performance improvements
+
+Continue exploring the architecture and passes to understand how each transformation works and how to customize them for your workloads.

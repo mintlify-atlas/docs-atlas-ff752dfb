@@ -1,0 +1,455 @@
+---
+title: Pipeline Execution
+description: Run the complete microMLC transformation pipeline and understand output files
+---
+
+## Overview
+
+The `run_attn_cache_pipeline.sh` script executes the complete microMLC transformation pipeline, converting a high-level attention mechanism implementation through multiple optimization stages down to vectorized code ready for LLVM compilation.
+
+## Quick Start
+
+```bash
+cd ~/workspace/source
+./tools/run_attn_cache_pipeline.sh
+```
+
+**Expected runtime:** 5-15 seconds depending on system performance
+
+## Prerequisites
+
+<Steps>
+  <Step title="Build stablehlo-opt">
+    Ensure the compiler is built:
+    ```bash
+    make stablehlo-opt
+    # Verifies binary exists at:
+    # third_party/stablehlo/build/bin/stablehlo-opt
+    ```
+  </Step>
+  
+  <Step title="Prepare input IR">
+    Ensure the input file exists:
+    ```bash
+    ls ir/attn_complete.mlir
+    ```
+    This file should contain a complete attention mechanism in StableHLO/Linalg form.
+  </Step>
+  
+  <Step title="Run the pipeline">
+    Execute the complete pipeline:
+    ```bash
+    ./tools/run_attn_cache_pipeline.sh
+    ```
+  </Step>
+</Steps>
+
+## Pipeline Script Details
+
+### Configuration Variables
+
+The script uses these key variables:
+
+```bash
+OPT_BIN="third_party/stablehlo/build/bin/stablehlo-opt"
+IR_DIR="ir"
+INPUT="${IR_DIR}/attn_complete.mlir"
+```
+
+You can override these by editing the script or setting environment variables.
+
+### Script Execution Flow
+
+The pipeline runs 5 transformation stages sequentially:
+
+<Steps>
+  <Step title="Stage 0: Initial cleanup">
+    **Input:** `ir/attn_complete.mlir` (StableHLO)
+    
+    **Output:** `ir/attn_stage0_linalg.mlir` (Linalg)
+    
+    ```bash
+    stablehlo-opt \
+      -stablehlo-tiling \
+      -canonicalize -cse \
+      attn_complete.mlir -o attn_stage0_linalg.mlir
+    ```
+    
+    Converts StableHLO operations to Linalg generic operations with affine maps.
+  </Step>
+  
+  <Step title="Stage 1: Generic fusion">
+    **Input:** `ir/attn_stage0_linalg.mlir`
+    
+    **Output:** `ir/attn_stage1_fused.mlir`
+    
+    ```bash
+    stablehlo-opt \
+      -generic-fusion \
+      -canonicalize -cse \
+      attn_stage0_linalg.mlir -o attn_stage1_fused.mlir
+    ```
+    
+    Fuses element-wise epilogues while keeping named matmuls intact.
+  </Step>
+  
+  <Step title="Stage 2: Tensor tiling">
+    **Input:** `ir/attn_stage1_fused.mlir`
+    
+    **Output:** `ir/attn_stage2_tiled_tensor.mlir`
+    
+    ```bash
+    stablehlo-opt \
+      "-stablehlo-linalg-tiling=l2-tile-sizes=64,64,64 l1-tile-sizes=4,4,4 enable-promotion=false" \
+      -canonicalize -cse \
+      attn_stage1_fused.mlir -o attn_stage2_tiled_tensor.mlir
+    ```
+    
+    Introduces hierarchical tiling:
+    - **L2 tiles (64×64×64):** Fit in L2 cache (~256KB)
+    - **L1 tiles (4×4×4):** Align with vector registers
+    - **No promotion:** Explicit buffer promotion disabled (handled in bufferization)
+  </Step>
+  
+  <Step title="Stage 3: Bufferization">
+    **Input:** `ir/attn_stage2_tiled_tensor.mlir`
+    
+    **Output:** `ir/attn_stage3_bufferized.mlir`
+    
+    ```bash
+    stablehlo-opt \
+      -canonicalize -cse \
+      -empty-tensor-to-alloc-tensor \
+      "-one-shot-bufferize=bufferize-function-boundaries allow-return-allocs" \
+      -convert-bufferization-to-memref \
+      -canonicalize -cse \
+      attn_stage2_tiled_tensor.mlir -o attn_stage3_bufferized.mlir
+    ```
+    
+    Converts tensors to explicit memory buffers (memrefs).
+  </Step>
+  
+  <Step title="Stage 5: Vectorization">
+    **Input:** `ir/attn_stage3_bufferized.mlir`
+    
+    **Output:** `ir/attn_stage5_vectorized.mlir`
+    
+    ```bash
+    stablehlo-opt \
+      "-toy-vectorize=vector-width=4 enable-reductions" \
+      -canonicalize -cse \
+      attn_stage3_bufferized.mlir -o attn_stage5_vectorized.mlir
+    ```
+    
+    Converts innermost loops to SIMD vector operations (4-wide f32 vectors).
+    
+    <Note>
+      Stage 4 was removed from the pipeline. Vectorization now happens directly after bufferization.
+    </Note>
+  </Step>
+</Steps>
+
+## Output Files
+
+After successful execution, you'll have these files in the `ir/` directory:
+
+### Stage 0: Linalg (6.1 KB)
+
+```bash
+ir/attn_stage0_linalg.mlir
+```
+
+**Contents:**
+- Linalg generic operations with affine indexing maps
+- Named operations: `linalg.matmul`, `linalg.batch_matmul`
+- Tensor-based computation (no explicit memory)
+- Affine maps like `affine_map<(d0, d1, d2) -> (d0, d1)>`
+
+**Example snippet:**
+```mlir
+%10 = linalg.batch_matmul 
+  ins(%collapsed_7, %collapsed_8 : tensor<4x128x32xf32>, tensor<4x32x128xf32>) 
+  outs(%9 : tensor<4x128x128xf32>) -> tensor<4x128x128xf32>
+
+%11 = linalg.generic {
+  indexing_maps = [#map3, #map3], 
+  iterator_types = ["parallel", "parallel", "parallel"]
+} ins(%10 : tensor<4x128x128xf32>) outs(%9 : tensor<4x128x128xf32>) {
+^bb0(%in: f32, %out: f32):
+  %23 = arith.mulf %in, %cst_1 : f32
+  linalg.yield %23 : f32
+} -> tensor<4x128x128xf32>
+```
+
+### Stage 1: Fused (6.2 KB)
+
+```bash
+ir/attn_stage1_fused.mlir
+```
+
+**Contents:**
+- Similar to Stage 0, but with fewer operations
+- Element-wise operations fused into producers
+- Reduced intermediate tensor allocations
+
+**Changes from Stage 0:**
+- Scalar multiplies and adds merged into matmul epilogues
+- Fewer `linalg.generic` operations
+
+### Stage 2: Tiled Tensor (18 KB)
+
+```bash
+ir/attn_stage2_tiled_tensor.mlir
+```
+
+**Contents:**
+- Nested `scf.for` loops for tiled iteration
+- `tensor.extract_slice` to extract tiles
+- `tensor.insert_slice` to write results back
+- Still in tensor form (no memrefs yet)
+
+**Example snippet:**
+```mlir
+scf.for %arg5 = %c0 to %c4 step %c64 {
+  scf.for %arg6 = %c0 to %c128 step %c64 {
+    scf.for %arg7 = %c0 to %c128 step %c64 {
+      %extracted_slice = tensor.extract_slice %arg0[%arg5, %arg6, %arg7][64, 64, 64][1, 1, 1]
+      // ... tiled computation ...
+      %inserted_slice = tensor.insert_slice %result into %dest[%arg5, %arg6, %arg7][64, 64, 64][1, 1, 1]
+    }
+  }
+}
+```
+
+### Stage 3: Bufferized (18 KB)
+
+```bash
+ir/attn_stage3_bufferized.mlir
+```
+
+**Contents:**
+- `memref.alloc()` for buffer allocation
+- `memref.load` and `memref.store` for memory access
+- `memref.dealloc()` for cleanup
+- Function signatures use `memref<1x128x128xf32, strided<[?, ?, ?], offset: ?>>`
+
+**Example snippet:**
+```mlir
+func.func public @main(
+  %arg0: memref<1x128x128xf32, strided<[?, ?, ?], offset: ?>>,
+  %arg1: memref<1x128x128xf32, strided<[?, ?, ?], offset: ?>>,
+  %arg2: memref<1x128x128xf32, strided<[?, ?, ?], offset: ?>>,
+  %arg3: memref<1x128x128xf32, strided<[?, ?, ?], offset: ?>>
+) -> memref<1x128x128xf32> {
+  %alloc = memref.alloc() : memref<128x128xf32>
+  // ... computation ...
+  memref.dealloc %alloc : memref<128x128xf32>
+}
+```
+
+<Warning>
+  After this stage, all operations are in-place. Tensors are gone, replaced by explicit memory management.
+</Warning>
+
+### Stage 5: Vectorized (20 KB)
+
+```bash
+ir/attn_stage5_vectorized.mlir
+```
+
+**Contents:**
+- `vector.transfer_read` for loading vector data
+- `vector.transfer_write` for storing vector results
+- Vector arithmetic: `vector.fma`, `vector.mul`, `arith.addf` on vectors
+- Vector reductions: `vector.reduction` for sum/max
+
+**Example snippet:**
+```mlir
+%0 = vector.transfer_read %arg0[%c0, %c0, %c0], %cst 
+  {in_bounds = [true, true, true]} 
+  : memref<1x128x128xf32>, vector<1x4x4xf32>
+
+%1 = vector.transfer_read %arg1[%c0, %c0, %c0], %cst
+  {in_bounds = [true, true, true]} 
+  : memref<1x128x128xf32>, vector<1x4x4xf32>
+
+%2 = arith.mulf %0, %1 : vector<1x4x4xf32>
+
+vector.transfer_write %2, %alloc[%c0, %c0, %c0] 
+  {in_bounds = [true, true, true]} 
+  : vector<1x4x4xf32>, memref<1x128x128xf32>
+```
+
+<Note>
+  Vector width of 4 corresponds to 4 × f32 = 128-bit SIMD vectors, compatible with SSE/NEON.
+</Note>
+
+## Pipeline Output Summary
+
+When the pipeline completes successfully, you'll see:
+
+```bash
+Pipeline completed. Outputs:
+  ir/attn_stage0_linalg.mlir
+  ir/attn_stage1_fused.mlir
+  ir/attn_stage2_tiled_tensor.mlir
+  ir/attn_stage3_bufferized.mlir
+  ir/attn_stage5_vectorized.mlir
+```
+
+## Verifying Pipeline Success
+
+Check that all output files were created:
+
+```bash
+ls -lh ir/attn_stage*.mlir
+```
+
+Expected output:
+```
+-rw-r--r--  1 user  staff   6.1K  attn_stage0_linalg.mlir
+-rw-r--r--  1 user  staff   6.2K  attn_stage1_fused.mlir
+-rw-r--r--  1 user  staff    18K  attn_stage2_tiled_tensor.mlir
+-rw-r--r--  1 user  staff    18K  attn_stage3_bufferized.mlir
+-rw-r--r--  1 user  staff    20K  attn_stage5_vectorized.mlir
+```
+
+<Check>
+  File sizes growing from Stage 2 onward indicates tiling and vectorization are working correctly.
+</Check>
+
+## Inspecting Intermediate Results
+
+View a specific stage's output:
+
+```bash
+cat ir/attn_stage1_fused.mlir | less
+```
+
+Search for specific operations:
+
+```bash
+# Count matmul operations
+grep -c "linalg.matmul" ir/attn_stage0_linalg.mlir
+
+# Find vector operations
+grep "vector.transfer" ir/attn_stage5_vectorized.mlir | head -10
+
+# Check memory operations
+grep -E "memref\.(alloc|dealloc)" ir/attn_stage3_bufferized.mlir
+```
+
+## Customizing the Pipeline
+
+### Modify Tile Sizes
+
+Edit the script to change tiling parameters:
+
+```bash
+# In tools/run_attn_cache_pipeline.sh, line 35:
+"-stablehlo-linalg-tiling=l2-tile-sizes=128,128,128 l1-tile-sizes=8,8,8 enable-promotion=false"
+```
+
+**Guidelines:**
+- **L2 tiles:** Should fit in L2 cache (typically 256KB-1MB per core)
+- **L1 tiles:** Should align with vector width and L1 cache
+- Larger tiles = fewer loop iterations but more register pressure
+
+### Modify Vector Width
+
+Change the vectorization width:
+
+```bash
+# In tools/run_attn_cache_pipeline.sh, line 50:
+"-toy-vectorize=vector-width=8 enable-reductions"
+```
+
+**Options:**
+- `vector-width=4`: SSE/NEON (4 × f32 = 128-bit)
+- `vector-width=8`: AVX2 (8 × f32 = 256-bit)
+- `vector-width=16`: AVX-512 (16 × f32 = 512-bit)
+
+### Run Partial Pipeline
+
+Comment out stages to stop at a specific point:
+
+```bash
+# Stage 0: initial stablehlo cleanup
+"${OPT_BIN}" \
+  -stablehlo-tiling \
+  -canonicalize -cse \
+  "${INPUT}" -o "${OUT0}"
+
+# Stage 1: fuse epilogues
+"${OPT_BIN}" \
+  -generic-fusion \
+  -canonicalize -cse \
+  "${OUT0}" -o "${OUT1}"
+
+# Comment out remaining stages to stop here
+# "${OPT_BIN}" ...
+
+echo "Pipeline stopped at Stage 1"
+exit 0
+```
+
+## Troubleshooting
+
+### Pipeline Fails at Stage 0
+
+**Error:** `Input MLIR missing at ir/attn_complete.mlir`
+
+**Solution:** Ensure the input file exists:
+```bash
+ls ir/attn_complete.mlir
+# If missing, you need to generate or copy it
+```
+
+### Pipeline Fails at Stage 2
+
+**Error:** `verification error: tile size too large`
+
+**Solution:** Reduce tile sizes in the tiling pass:
+```bash
+"-stablehlo-linalg-tiling=l2-tile-sizes=32,32,32 l1-tile-sizes=4,4,4 enable-promotion=false"
+```
+
+### Pipeline Fails at Stage 3
+
+**Error:** `bufferization failed: unable to infer result type`
+
+**Solution:** Add explicit type hints or fix tensor shape inference in earlier stages.
+
+### Pipeline Fails at Stage 5
+
+**Error:** `vectorization failed: operation not vectorizable`
+
+**Solution:** 
+- Check that bufferization produced valid memref operations
+- Ensure innermost loops are small enough (L1 tile size)
+- Try `conservative=true` option: `-toy-vectorize=vector-width=4 conservative=true`
+
+### Slow Execution
+
+**Issue:** Pipeline takes >1 minute to complete
+
+**Possible causes:**
+- Input file is very large (>100KB MLIR)
+- Debug assertions enabled in LLVM build
+- Disk I/O bottleneck
+
+**Solution:**
+- Build stablehlo-opt in Release mode: `cmake -DCMAKE_BUILD_TYPE=Release`
+- Use faster storage (SSD instead of HDD)
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Running Individual Passes" icon="gears" href="/usage/running-passes">
+    Learn how to run passes manually for debugging
+  </Card>
+  
+  <Card title="Benchmarking" icon="stopwatch" href="/usage/benchmarking">
+    Measure performance of the optimized code
+  </Card>
+</CardGroup>

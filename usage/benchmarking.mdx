@@ -1,0 +1,512 @@
+---
+title: Benchmarking
+description: Measure performance of transformed code and analyze optimization impact
+---
+
+## Overview
+
+MicroMLC provides comprehensive benchmarking tools to measure the performance impact of each pipeline stage. By lowering MLIR to executable LLVM code and running it with mlir-cpu-runner, you can quantify the speedup from tiling, fusion, and vectorization optimizations.
+
+## Benchmark Scripts
+
+There are two primary benchmarking scripts:
+
+1. **`benchmark_all_stages.sh`** - Benchmark all pipeline stages (Stage 0-5)
+2. **`benchmark_stage5.sh`** - Single-stage execution for detailed profiling
+
+## Prerequisites
+
+<Steps>
+  <Step title="Complete the pipeline">
+    Run the transformation pipeline first:
+    ```bash
+    ./tools/run_attn_cache_pipeline.sh
+    ```
+    This generates all stage outputs in `ir/attn_stage*.mlir`.
+  </Step>
+  
+  <Step title="Install LLVM tools">
+    Ensure mlir-cpu-runner is available:
+    ```bash
+    which mlir-cpu-runner
+    # On macOS with Homebrew:
+    # /opt/homebrew/opt/llvm@17/bin/mlir-cpu-runner
+    ```
+  </Step>
+  
+  <Step title="Install hyperfine (optional)">
+    For statistical benchmarking:
+    ```bash
+    # macOS
+    brew install hyperfine
+    
+    # Linux
+    cargo install hyperfine
+    # or apt install hyperfine
+    ```
+  </Step>
+</Steps>
+
+## Benchmarking All Stages
+
+### Basic Execution
+
+Run benchmarks for all pipeline stages:
+
+```bash
+cd ~/workspace/source
+./tools/benchmark_all_stages.sh
+```
+
+**Expected runtime:** 2-5 minutes (depends on iteration count and hyperfine)
+
+### What It Does
+
+<Steps>
+  <Step title="Generate benchmark driver">
+    For each stage, the script injects a benchmark harness:
+    - Allocates input tensors/memrefs
+    - Calls the `@main` function in a loop (default 100 iterations)
+    - Stores result to prevent compiler optimization
+  </Step>
+  
+  <Step title="Lower to LLVM dialect">
+    Applies a comprehensive lowering pipeline:
+    - Convert Linalg to loops
+    - Lower affine operations
+    - Convert vectors to LLVM intrinsics
+    - Finalize memrefs to LLVM pointers
+  </Step>
+  
+  <Step title="Run and time execution">
+    Executes the code with mlir-cpu-runner:
+    - Single warmup run to verify correctness
+    - Multiple timed runs with hyperfine (if available)
+    - Measures wall-clock time including setup overhead
+  </Step>
+  
+  <Step title="Collect memory statistics">
+    Counts memory operations in the IR:
+    - `memref.copy`
+    - `memref.load` / `memref.store`
+    - `vector.transfer_read` / `vector.transfer_write`
+  </Step>
+</Steps>
+
+### Configuration Options
+
+Control benchmark behavior with environment variables:
+
+```bash
+# Set number of iterations (default: 100)
+ITERS=500 ./tools/benchmark_all_stages.sh
+
+# Override LLVM installation path
+LLVM_PREFIX=/usr/local/opt/llvm ./tools/benchmark_all_stages.sh
+```
+
+### Understanding Output
+
+For each stage, you'll see output like:
+
+```bash
++ mlir-cpu-runner /tmp/attn_stage0_linalg_llvm.mlir -O3 -e read_sink ...
+2.34e-05
+
+Benchmark 1: mlir-cpu-runner /tmp/attn_stage0_linalg_llvm.mlir -O3 -e bench ...
+  Time (mean ± σ):      1.234 s ±  0.045 s    [User: 1.198 s, System: 0.032 s]
+  Range (min … max):    1.187 s …  1.289 s    10 runs
+
+Memory op counts for attn_stage0_linalg:
+memref.copy: 0
+memref.load: 142
+memref.store: 67
+vector.transfer_read: 0
+vector.transfer_write: 0
+```
+
+**Interpreting results:**
+- **First line (2.34e-05):** Single execution result for correctness check
+- **Time (mean ± σ):** Average execution time over multiple runs
+- **Range (min … max):** Performance variance
+- **Memory op counts:** Operation frequency in the IR (not runtime counts)
+
+## Stage-by-Stage Performance Analysis
+
+### Expected Performance Progression
+
+Typical results for a 128×128 attention mechanism:
+
+| Stage | Description | Time (relative) | Speedup | Memory Ops |
+|-------|-------------|-----------------|---------|------------|
+| Stage 0 | Linalg | 1.00× (baseline) | 1.0× | 200+ loads/stores |
+| Stage 1 | Fused | 0.85× | 1.18× | ~180 loads/stores |
+| Stage 2 | Tiled | 0.65× | 1.54× | Similar, better locality |
+| Stage 3 | Bufferized | 0.60× | 1.67× | Explicit allocations |
+| Stage 5 | Vectorized | 0.25× | 4.0× | 50+ vector transfers |
+
+<Note>
+  Actual speedups depend heavily on:
+  - CPU architecture (SIMD support, cache sizes)
+  - Input size (128×128 is small; larger inputs see bigger gains)
+  - Tile size tuning
+  - Compiler optimization level (always use -O3)
+</Note>
+
+### Key Observations
+
+**Stage 1 (Fusion):**
+- Modest 10-20% speedup from reducing intermediate allocations
+- Fewer linalg.generic operations in the IR
+
+**Stage 2 (Tiling):**
+- 30-50% speedup from cache locality
+- L2 tiles (64×64×64) fit in cache, reducing DRAM traffic
+- L1 tiles (4×4×4) prepare for vectorization
+
+**Stage 3 (Bufferization):**
+- Similar performance to Stage 2, sometimes slightly faster
+- Explicit memory management enables further optimizations
+
+**Stage 5 (Vectorization):**
+- **2-4× speedup** from SIMD parallelism
+- Vector width of 4 means 4× theoretical speedup
+- Actual speedup limited by memory bandwidth, loop overhead, and vectorization efficiency
+
+## Benchmarking a Single Stage
+
+### Detailed Profiling with benchmark_stage5.sh
+
+For focused analysis of the final vectorized stage:
+
+```bash
+./tools/benchmark_stage5.sh
+```
+
+### What This Script Does
+
+<Steps>
+  <Step title="Build driver function">
+    Injects a `@driver` function into the stage 5 IR:
+    ```mlir
+    func.func @driver() -> f32 {
+      %zero = arith.constant 0.0 : f32
+      %A = memref.alloc() : memref<1x128x128xf32>
+      %B = memref.alloc() : memref<1x128x128xf32>
+      %C = memref.alloc() : memref<1x128x128xf32>
+      %D = memref.alloc() : memref<1x128x128xf32>
+      linalg.fill ins(%zero : f32) outs(%A : memref<1x128x128xf32>)
+      // ... fill other buffers ...
+      %out = func.call @main(%A, %B, %C, %D)
+      %val = memref.load %out[%c0, %c0, %c0]
+      // ... dealloc buffers ...
+      func.return %val : f32
+    }
+    ```
+  </Step>
+  
+  <Step title="Multi-stage lowering">
+    The script performs careful lowering in two stages:
+    
+    **Stage 1:** Convert control flow and index operations
+    ```bash
+    stablehlo-opt driver.mlir \
+      -fix-unrealized-index-casts \
+      -convert-linalg-to-loops \
+      -lower-affine \
+      -cf-integerize-index-block-args \
+      -convert-scf-to-cf \
+      -convert-index-to-llvm \
+      -reconcile-unrealized-casts \
+      -o step1.mlir
+    ```
+    
+    **Stage 2:** Finish LLVM lowering
+    ```bash
+    stablehlo-opt step1.mlir \
+      -convert-index-to-llvm \
+      -convert-math-to-llvm \
+      -convert-arith-to-llvm \
+      -convert-vector-to-llvm \
+      -convert-func-to-llvm \
+      -finalize-memref-to-llvm \
+      -reconcile-unrealized-casts \
+      -o llvm.mlir
+    ```
+  </Step>
+  
+  <Step title="Translate to LLVM IR">
+    Converts MLIR LLVM dialect to native LLVM IR:
+    ```bash
+    mlir-translate --mlir-to-llvmir llvm.mlir -o llvm.ll
+    ```
+  </Step>
+  
+  <Step title="Execute and time">
+    Runs the LLVM IR with mlir-cpu-runner:
+    ```bash
+    mlir-cpu-runner llvm.ll -O3 -e driver -entry-point-result=f32 \
+      -shared-libs=.../libmlir_runner_utils.dylib \
+      -shared-libs=.../libmlir_c_runner_utils.dylib \
+      -shared-libs=.../libmlir_async_runtime.dylib \
+      -shared-libs=.../libomp.dylib
+    ```
+  </Step>
+</Steps>
+
+### Output Files
+
+The script creates intermediate files in `/tmp`:
+
+```bash
+/tmp/attn_stage5_driver.mlir      # IR with @driver function
+/tmp/attn_stage5_step1.mlir       # After first lowering stage
+/tmp/attn_stage5_llvm.mlir        # LLVM dialect MLIR
+/tmp/attn_stage5_llvm.ll          # Native LLVM IR
+```
+
+Inspect these files to understand the lowering process:
+
+```bash
+# View LLVM IR
+cat /tmp/attn_stage5_llvm.ll | less
+
+# Search for vector instructions
+grep "<4 x float>" /tmp/attn_stage5_llvm.ll
+
+# Check for SIMD intrinsics
+grep -E "@llvm\.(x86\.sse|aarch64\.neon)" /tmp/attn_stage5_llvm.ll
+```
+
+## Performance Analysis
+
+### Memory Operation Profiling
+
+The benchmark scripts count memory operations in the IR:
+
+```bash
+Memory op counts for attn_stage5_vectorized:
+memref.copy: 0
+memref.load: 8
+memref.store: 12
+vector.transfer_read: 64
+vector.transfer_write: 32
+```
+
+**Interpretation:**
+- **Low scalar loads/stores:** Most memory access is vectorized
+- **High vector transfers:** Indicates successful vectorization
+- **Ratio of reads to writes:** Should match computation pattern (attention has more reads)
+
+### Measuring Vectorization Efficiency
+
+Compare Stage 3 (scalar memrefs) to Stage 5 (vectorized):
+
+```bash
+# Stage 3: scalar operations
+Time: 1.200 s
+memref.load: 245
+memref.store: 128
+
+# Stage 5: vector operations  
+Time: 0.310 s
+vector.transfer_read: 64
+vector.transfer_write: 32
+```
+
+**Speedup calculation:**
+- Time reduction: 1.200s → 0.310s = **3.87× speedup**
+- Memory op reduction: (245+128) → (64+32) = **3.89× fewer operations**
+
+Strong correlation indicates vectorization is working as intended.
+
+### Comparing Tile Sizes
+
+Benchmark different tiling configurations:
+
+```bash
+# Baseline: L2=64, L1=4
+./tools/run_attn_cache_pipeline.sh
+./tools/benchmark_all_stages.sh
+# Record Stage 5 time
+
+# Edit tools/run_attn_cache_pipeline.sh to use L2=128, L1=8
+# Re-run pipeline and benchmark
+./tools/run_attn_cache_pipeline.sh
+./tools/benchmark_all_stages.sh
+# Compare Stage 5 time
+```
+
+**Tuning guidelines:**
+- Larger L2 tiles: Better for large matrices, but may spill cache
+- Larger L1 tiles: Better vectorization, but more register pressure
+- Optimal sizes depend on target hardware
+
+## Advanced Benchmarking
+
+### Using Linux perf
+
+Profile with hardware performance counters:
+
+```bash
+# Run with perf stat
+perf stat -e cycles,instructions,L1-dcache-load-misses,L1-dcache-loads \
+  mlir-cpu-runner /tmp/attn_stage5_llvm.mlir -O3 -e driver ...
+```
+
+**Useful metrics:**
+- **IPC (instructions per cycle):** Higher is better (>1.5 is good)
+- **L1 cache miss rate:** Should be \<5% with good tiling
+- **Branch mispredictions:** Should be low in compute-heavy code
+
+### Isolating Specific Optimizations
+
+Benchmark the impact of a single pass:
+
+```bash
+# Benchmark without vectorization
+stablehlo-opt ir/attn_stage3_bufferized.mlir \
+  -convert-linalg-to-loops \
+  ... (lowering passes) ... \
+  -o /tmp/stage3_no_vec.mlir
+# Time this version
+
+# Benchmark with vectorization
+stablehlo-opt ir/attn_stage5_vectorized.mlir \
+  ... (same lowering passes) ... \
+  -o /tmp/stage5_vec.mlir
+# Time this version
+
+# Compare times to measure vectorization impact
+```
+
+### Comparing to Naive Implementation
+
+Benchmark against unoptimized code:
+
+```bash
+# Run Stage 0 (basic Linalg, no optimizations)
+Time: 2.345 s
+
+# Run Stage 5 (fully optimized)
+Time: 0.312 s
+
+# Total speedup
+2.345 / 0.312 = 7.51×
+```
+
+This measures the **end-to-end benefit of the entire pipeline**.
+
+## Interpreting Results
+
+### What's a Good Speedup?
+
+For a 4-wide vector unit:
+- **Theoretical maximum:** 4× from vectorization alone
+- **Good result:** 3-3.5× (75-87% of theoretical)
+- **Excellent result:** >3.5× (additional gains from fusion/tiling)
+
+### Common Performance Issues
+
+**Low speedup from vectorization (\<2×):**
+- Memory bandwidth bottleneck (check with `perf mem`)
+- Vector operations not fusing properly
+- Inefficient vector load/store patterns
+- Tile sizes too small or too large
+
+**High variance in timing:**
+- CPU frequency scaling (disable with `cpupower` on Linux)
+- Background processes (benchmark on idle system)
+- Thermal throttling (ensure adequate cooling)
+
+**Stage 2 slower than Stage 1:**
+- Tile sizes don't match cache hierarchy
+- Too much tiling overhead for small problem size
+- Try larger L2 tiles or skip tiling for small inputs
+
+## Benchmarking Tips
+
+<Note>
+  **Always use -O3 optimization level.** The mlir-cpu-runner applies LLVM optimizations that are critical for performance.
+</Note>
+
+<Warning>
+  **Benchmark on a quiet system.** Background tasks can introduce 10-30% variance in timing results.
+</Warning>
+
+<Check>
+  **Run warmup iterations.** The first execution may be slower due to cold caches and dynamic linking overhead.
+</Check>
+
+### Reproducible Benchmarks
+
+For consistent results:
+
+```bash
+# Linux: disable CPU frequency scaling
+sudo cpupower frequency-set -g performance
+
+# Linux: disable turbo boost
+echo 0 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+
+# macOS: close background apps and disable Spotlight indexing
+sudo mdutil -a -i off
+
+# Run benchmarks
+ITERS=1000 ./tools/benchmark_all_stages.sh
+
+# Re-enable dynamic settings after
+```
+
+## Troubleshooting
+
+### Benchmark Fails: Shared Library Not Found
+
+**Error:** `libmlir_runner_utils.dylib not found`
+
+**Solution:** Set `LLVM_PREFIX` to your LLVM installation:
+```bash
+LLVM_PREFIX=/opt/homebrew/opt/llvm@17 ./tools/benchmark_all_stages.sh
+```
+
+### Benchmark Fails: Entry Point Not Found
+
+**Error:** `@read_sink or @bench not found`
+
+**Solution:** The benchmark harness injection failed. Check that:
+- Stage files exist in `ir/`
+- Python 3 is available
+- Files are not corrupted
+
+### Very Slow Execution (>10s per stage)
+
+**Possible causes:**
+- `ITERS` set too high (default 100)
+- Running debug build of LLVM (always use Release)
+- Problem size too large for quick benchmarking
+
+**Solution:**
+```bash
+ITERS=10 ./tools/benchmark_all_stages.sh  # Fewer iterations
+```
+
+### Results Don't Match Expected Speedup
+
+**Possible causes:**
+- Different CPU microarchitecture
+- Different LLVM version or optimization settings
+- Small input size (128×128) doesn't show full optimization benefit
+
+**Solution:** Try larger input sizes for more representative results.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Running Individual Passes" icon="gears" href="/usage/running-passes">
+    Debug performance issues by running passes manually
+  </Card>
+  
+  <Card title="Pipeline Execution" icon="diagram-project" href="/usage/pipeline-execution">
+    Review the complete transformation pipeline
+  </Card>
+</CardGroup>

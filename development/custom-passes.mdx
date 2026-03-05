@@ -1,0 +1,538 @@
+---
+title: Creating Custom Passes
+description: Learn how to create, register, and integrate custom MLIR passes into the microMLC build system
+---
+
+## Overview
+
+Custom passes in microMLC follow the MLIR pass infrastructure. This guide walks through creating a new pass from scratch, using real examples from the codebase.
+
+## Pass Architecture
+
+The microMLC pass system has three core components:
+
+1. **TableGen definitions** (`Passes.td`) - Declare passes and their options
+2. **C++ headers** (`Passes.h`) - Factory functions and registration
+3. **C++ implementation** (e.g., `MyPass.cpp`) - Pass logic
+4. **Build integration** (`CMakeLists.txt`) - Link into the build
+5. **Sync script** (`tools/sync_passes.sh`) - Deploy to StableHLO tree
+
+## Step-by-Step: Creating a New Pass
+
+### 1. Define in TableGen (Passes.td)
+
+TableGen provides declarative pass metadata. Add your pass definition:
+
+```tablegen
+// passes/Passes.td
+def FixUnrealizedIndexCastsPass : Pass<"fix-unrealized-index-casts", "ModuleOp"> {
+  let summary = "Rewrite unrealized_conversion_cast iN -> index into arith.index_cast";
+  let dependentDialects = ["mlir::arith::ArithDialect"];
+}
+```
+
+**Key fields:**
+- **Pass name**: CLI flag (e.g., `-fix-unrealized-index-casts`)
+- **Operation scope**: `ModuleOp`, `func::FuncOp`, etc.
+- **summary**: Short description for `--help`
+- **dependentDialects**: Dialects this pass requires
+
+#### Example with Options
+
+```tablegen
+def VhloToVersionPass : Pass<"vhlo-to-version"> {
+  let summary = "Convert between versions of VHLO.";
+  let options = [
+    Option<"targetVersionOption", "target", "std::string", "",
+           "The target version. Must be a version of the form #.#.# or 'current'.">,
+  ];
+}
+```
+
+### 2. Declare in Header (Passes.h)
+
+**For TableGen-generated passes**, add a forward declaration if needed:
+
+```cpp
+// passes/Passes.h
+std::unique_ptr<Pass> createCfIntegerizeIndexBlockArgsPass();
+
+#define GEN_PASS_DECL_CFINTEGERIZEINDEXBLOCKARGSPASS
+#include "stablehlo/transforms/Passes.h.inc"
+```
+
+**For manually-registered passes**, declare factory and registration:
+
+```cpp
+// Factory method to create the GenericFusionPass
+std::unique_ptr<Pass> createGenericFusionPass();
+
+// Registration method to expose the GenericFusionPass to the CLI
+void registerGenericFusionPass();
+```
+
+### 3. Implement the Pass
+
+#### Pattern-Based Pass (Recommended)
+
+Most transformation passes use the **greedy pattern rewrite** driver:
+
+```cpp
+// passes/FixUnrealizedIndexCastsPass.cpp
+#include "stablehlo/transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+
+using namespace mlir;
+
+namespace {
+
+// Step 1: Define a rewrite pattern
+struct FixUnrealizedIndexCastPattern
+    : public OpRewritePattern<UnrealizedConversionCastOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(UnrealizedConversionCastOp op,
+                                PatternRewriter &rewriter) const override {
+    // Only handle the simple 1:1 index <-> integer cases
+    if (op.getInputs().size() != 1 || op.getOutputs().size() != 1)
+      return failure();
+
+    Value input = op.getInputs().front();
+    Value output = op.getOutputs().front();
+
+    auto srcType = input.getType();
+    auto dstType = output.getType();
+
+    auto srcInt = dyn_cast<IntegerType>(srcType);
+    auto dstIndex = dstType.isa<IndexType>();
+
+    // integer -> index conversion
+    if (srcInt && !srcInt.isa<IndexType>() && dstIndex) {
+      rewriter.replaceOpWithNewOp<arith::IndexCastOp>(op, dstType, input);
+      return success();
+    }
+    return failure();
+  }
+};
+
+// Step 2: Define the pass
+struct FixUnrealizedIndexCastsPass
+    : public PassWrapper<FixUnrealizedIndexCastsPass,
+                         OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FixUnrealizedIndexCastsPass)
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<arith::ArithDialect>();
+  }
+
+  StringRef getArgument() const final {
+    return "fix-unrealized-index-casts";
+  }
+
+  StringRef getDescription() const final {
+    return "Rewrite unrealized_conversion_cast iN -> index into arith.index_cast";
+  }
+
+  void runOnOperation() override {
+    MLIRContext *ctx = &getContext();
+    RewritePatternSet patterns(ctx);
+    patterns.add<FixUnrealizedIndexCastPattern>(ctx);
+
+    if (failed(applyPatternsAndFoldGreedily(getOperation(),
+                                            std::move(patterns)))) {
+      signalPassFailure();
+    }
+  }
+};
+
+}  // namespace
+
+// Step 3: Factory function
+namespace mlir {
+namespace stablehlo {
+
+std::unique_ptr<Pass> createFixUnrealizedIndexCastsPass() {
+  return std::make_unique<FixUnrealizedIndexCastsPass>();
+}
+
+}  // namespace stablehlo
+}  // namespace mlir
+```
+
+**Key components:**
+1. **Pattern class**: Inherits from `OpRewritePattern<OpType>`
+2. **matchAndRewrite()**: Return `success()` if rewrite applied, `failure()` otherwise
+3. **Pass class**: Inherits from `PassWrapper<YourPass, OperationPass<Scope>>`
+4. **MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID**: Required type ID macro
+5. **getDependentDialects()**: Declare required dialects
+6. **runOnOperation()**: Collect patterns and apply greedily
+
+#### Complex Pass Example: GenericFusionPass
+
+The `GenericFusionPass` demonstrates advanced pattern-based transformations:
+
+```cpp
+// passes/GenericFusionPass.cpp (simplified)
+struct GenericFusionPattern : public OpRewritePattern<GenericOp> {
+  using OpRewritePattern<GenericOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(GenericOp consumer,
+                                PatternRewriter &rewriter) const override {
+    
+    // Only fuse into elementwise consumers
+    if (!isElementwise(consumer)) return failure();
+
+    // Try to fuse each input producer
+    for (OpOperand *input : consumer.getDpsInputOperands()) {
+      Operation *defOp = input->get().getDefiningOp();
+      if (!defOp) continue;
+
+      auto producer = dyn_cast<LinalgOp>(defOp);
+      if (!producer || !isElementwise(producer)) continue;
+
+      if (hasReductionIterator(producer)) continue;
+
+      if (succeeded(fuseProducerEpilogue(producer, consumer, *input, rewriter)))
+        return success();
+    }
+    return failure();
+  }
+};
+
+struct GenericFusionPass
+    : public PassWrapper<GenericFusionPass, OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GenericFusionPass)
+
+  StringRef getArgument() const final { return "generic-fusion"; }
+  StringRef getDescription() const final { 
+    return "Fuses linalg producers into elementwise consumers"; 
+  }
+
+  void runOnOperation() override {
+    MLIRContext *ctx = &getContext();
+    RewritePatternSet patterns(ctx);
+    patterns.add<GenericFusionPattern>(ctx);
+    
+    GreedyRewriteConfig config;
+    config.useTopDownTraversal = true;
+    config.enableRegionSimplification = true;
+    config.maxIterations = 10;
+    
+    (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns), config);
+  }
+};
+```
+
+See the full implementation at `passes/GenericFusionPass.cpp:206-254`.
+
+### 4. Add to Build System (CMakeLists.txt)
+
+Register your `.cpp` file in the `PARTIAL_SOURCES_INTENDED` list:
+
+```cmake
+# passes/CMakeLists.txt
+add_mlir_dialect_library(StablehloPasses
+  PARTIAL_SOURCES_INTENDED
+  StablehloCanonicalizeDynamism.cpp
+  # ... existing passes ...
+  FixUnrealizedIndexCastsPass.cpp  # <-- Add your pass here
+  MyNewPass.cpp                     # <-- Your new pass
+
+  DEPENDS
+  PassesIncGen
+
+  LINK_LIBS PUBLIC
+  MLIRArithDialect
+  # ... add any new dialect dependencies ...
+)
+```
+
+If you need new MLIR dialects, add them to `LINK_LIBS PUBLIC`.
+
+### 5. Register for CLI (Manual Registration)
+
+For passes **not** using TableGen, add registration to `Passes.h`:
+
+```cpp
+namespace mlir {
+namespace stablehlo {
+
+void registerMyNewPass() {
+  PassRegistration<MyNewPass>();
+}
+
+}  // namespace stablehlo
+}  // namespace mlir
+```
+
+Call this registration function in StableHLO's main registration code (usually in `stablehlo-opt.cpp` or similar).
+
+### 6. Deploy with sync_passes.sh
+
+The `sync_passes.sh` script copies your pass files into the StableHLO source tree:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
+SRC_DIR="${ROOT}/passes"
+DST_DIR="${ROOT}/third_party/stablehlo/stablehlo/transforms"
+
+FILES=(
+  CMakeLists.txt
+  Passes.h
+  Passes.td
+  FixUnrealizedIndexCastsPass.cpp
+  MyNewPass.cpp  # <-- Add your file here
+)
+
+for f in "${FILES[@]}"; do
+  src="${SRC_DIR}/${f}"
+  [[ -f "${src}" ]] || { echo "Missing ${src}" >&2; exit 1; }
+  cp -f "${src}" "${DST_DIR}/"
+done
+
+echo "Synced passes into ${DST_DIR}"
+```
+
+Update the `FILES` array with your new pass files, then run:
+
+```bash
+bash tools/sync_passes.sh
+```
+
+### 7. Rebuild stablehlo-opt
+
+After syncing, rebuild the optimizer:
+
+```bash
+cmake --build third_party/stablehlo/build -t stablehlo-opt
+```
+
+### 8. Test Your Pass
+
+Run your pass on test IR:
+
+```bash
+third_party/stablehlo/build/bin/stablehlo-opt \
+  ir/test_input.mlir \
+  -my-new-pass \
+  -o /tmp/output.mlir
+```
+
+## Pass Patterns Reference
+
+### OpRewritePattern vs OpConversionPattern
+
+- **`OpRewritePattern`**: For IR-to-IR transformations within the same dialect(s)
+- **`OpConversionPattern`**: For dialect conversions (e.g., StableHLO → Linalg)
+
+### Common Pattern Idioms
+
+#### 1. Matching Operation Types
+
+```cpp
+if (auto matmul = dyn_cast<linalg::MatmulOp>(op)) {
+  // Process matmul
+}
+```
+
+#### 2. Traversing Use-Def Chains
+
+```cpp
+Value input = op.getOperand(0);
+Operation *producer = input.getDefiningOp();
+if (!producer) return failure();  // Block argument
+```
+
+#### 3. Checking Attributes
+
+```cpp
+if (op->hasAttr("done_tiling")) {
+  return failure();  // Skip already-tiled ops
+}
+```
+
+#### 4. Replacing Operations
+
+```cpp
+// Replace with new op of same type
+rewriter.replaceOpWithNewOp<arith::AddFOp>(op, lhs, rhs);
+
+// Replace with existing value
+rewriter.replaceOp(op, newValue);
+
+// Erase without replacement
+rewriter.eraseOp(op);
+```
+
+#### 5. Creating New Operations
+
+```cpp
+rewriter.setInsertionPoint(op);
+Value newOp = rewriter.create<linalg::GenericOp>(
+    op.getLoc(), resultTypes, operands, attributes);
+```
+
+#### 6. Safe Recursion Guards
+
+From `TilingPass.cpp:31-35`:
+
+```cpp
+if (op->hasAttr("done_tiling")) {
+  return failure();  // Prevent infinite recursion
+}
+
+// ... perform tiling ...
+
+newOp->setAttr("done_tiling", rewriter.getUnitAttr());
+```
+
+## Pass Configuration with Options
+
+The `ToyVectorizationPass` shows how to expose pass options:
+
+```cpp
+struct ToyVectorizationPass
+    : public PassWrapper<ToyVectorizationPass, OperationPass<func::FuncOp>> {
+  
+  Option<int64_t> vectorWidth{
+    *this, "vector-width", 
+    llvm::cl::desc("Vector width"), 
+    llvm::cl::init(4)
+  };
+  
+  Option<bool> conservative{
+    *this, "conservative",
+    llvm::cl::desc("Require static shapes + permutation maps"),
+    llvm::cl::init(true)
+  };
+
+  void runOnOperation() override {
+    // Access option values
+    if (vectorWidth > 8) { /* ... */ }
+  }
+};
+```
+
+**Usage:**
+```bash
+stablehlo-opt -toy-vectorize="vector-width=8 conservative=false" input.mlir
+```
+
+## Multi-Pass Pipelines
+
+From `tools/run_attn_cache_pipeline.sh:22-52`, passes compose into pipelines:
+
+```bash
+stablehlo-opt \
+  -stablehlo-tiling \
+  -canonicalize -cse \
+  -generic-fusion \
+  -canonicalize -cse \
+  "-stablehlo-linalg-tiling=l2-tile-sizes=64,64,64 l1-tile-sizes=4,4,4" \
+  -canonicalize -cse \
+  -empty-tensor-to-alloc-tensor \
+  "-one-shot-bufferize=bufferize-function-boundaries allow-return-allocs" \
+  -convert-bufferization-to-memref \
+  -canonicalize -cse \
+  "-toy-vectorize=vector-width=4 enable-reductions" \
+  -o output.mlir
+```
+
+**Best practice:** Run `-canonicalize -cse` between passes to clean up IR.
+
+## Common Pitfalls
+
+### 1. Infinite Recursion
+
+**Problem:** Pattern rewrites create ops that match the same pattern.
+
+**Solution:** Use attribute guards (see `TilingPass.cpp:31`):
+
+```cpp
+if (op->hasAttr("done_tiling")) return failure();
+partialOp->setAttr("done_tiling", rewriter.getUnitAttr());
+```
+
+### 2. Incorrect Operand Indices
+
+From `GenericFusionPass.cpp:48-66`, always validate indices:
+
+```cpp
+if (prodMaps.size() <= producer.getNumDpsInputs() + prodResultIdx)
+  return failure();
+if (consMaps.size() <= consumerInputIdx)
+  return failure();
+```
+
+### 3. Region Body Mutation
+
+Always use `IRMapping` when cloning operations across regions:
+
+```cpp
+IRMapping mapper;
+mapper.map(oldBlockArg, newBlockArg);
+rewriter.clone(op, mapper);
+```
+
+### 4. Missing Dialect Registration
+
+**Symptom:** Crashes or "unknown dialect" errors.
+
+**Fix:** Add to `getDependentDialects()`:
+
+```cpp
+void getDependentDialects(DialectRegistry &registry) const override {
+  registry.insert<arith::ArithDialect, 
+                  linalg::LinalgDialect,
+                  scf::SCFDialect>();
+}
+```
+
+## Testing Your Pass
+
+### Unit Test with FileCheck
+
+Create a `.mlir` test file:
+
+```mlir
+// RUN: stablehlo-opt %s -my-new-pass | FileCheck %s
+
+func.func @test(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  // CHECK: arith.index_cast
+  // CHECK-NOT: unrealized_conversion_cast
+  %0 = unrealized_conversion_cast %arg0 : tensor<4x4xf32> to tensor<4x4xf32>
+  return %0 : tensor<4x4xf32>
+}
+```
+
+Run with `mlir-opt` or `lit`.
+
+### Integration Test
+
+Use the pipeline scripts:
+
+```bash
+bash tools/run_attn_cache_pipeline.sh
+# Check output in ir/attn_stage*.mlir
+```
+
+## Next Steps
+
+- **[Debugging Guide](./debugging)** - Learn MLIR debugging techniques
+- **[Contributing](./contributing)** - Submit your pass upstream
+- **[Pass Examples](https://github.com/llvm/llvm-project/tree/main/mlir/lib/Dialect)** - Study MLIR's built-in passes
+
+## Real-World Examples
+
+| Pass | Complexity | Key Techniques |
+|------|-----------|----------------|
+| [FixUnrealizedIndexCastsPass.cpp](https://github.com/micromlc/passes/FixUnrealizedIndexCastsPass.cpp) | Simple | Single-pattern rewrite |
+| [GenericFusionPass.cpp](https://github.com/micromlc/passes/GenericFusionPass.cpp) | Medium | Producer-consumer fusion, region merging |
+| [ToyVectorizationPass.cpp](https://github.com/micromlc/passes/ToyVectorizationPass.cpp) | Complex | Multi-stage pipeline, options, walker patterns |
+| [TilingPass.cpp](https://github.com/micromlc/passes/TilingPass.cpp) | Medium | Nested loop generation, recursion guards |

@@ -1,0 +1,363 @@
+---
+title: Dependencies
+description: Detailed dependency requirements for StableHLO, LLVM/MLIR, and runtime libraries
+---
+
+## Overview
+
+microMLC depends on specific versions of StableHLO and LLVM/MLIR for compilation, and requires runtime LLVM libraries for executing compiled IR. Understanding these dependencies is crucial for successful builds and reproducible results.
+
+## Component Versions
+
+| Component | Version | Commit | Purpose |
+|-----------|---------|--------|----------|
+| StableHLO | v0.13.0 | `75c7095a97c6aaaee15dfab1fac529ce695e1d4a` | Compiler infrastructure |
+| LLVM/MLIR (build) | llvmorg-18.1.8 | `3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff` | Build-time compiler |
+| LLVM (runtime) | 17.0.6 | Homebrew `llvm@17` | Runtime libraries |
+
+<Note>
+The distinction between build-time LLVM (18.1.8) and runtime LLVM (17.0.6) is intentional. The build uses LLVM 18 for compilation infrastructure, while execution uses LLVM 17 runtime libraries for stability.
+</Note>
+
+## StableHLO Dependencies
+
+### Core StableHLO
+
+**Version**: v0.13.0  
+**Repository**: https://github.com/openxla/stablehlo.git  
+**Commit**: `75c7095a97c6aaaee15dfab1fac529ce695e1d4a`
+
+StableHLO provides:
+- StableHLO dialect definitions
+- VHLO (Versioned HLO) dialect
+- StableHLO-to-Linalg conversions
+- Base transformation passes
+
+### StableHLO Build Requirements
+
+StableHLO requires:
+- MLIR libraries from LLVM 18.1.8
+- C++17 compliant compiler
+- CMake 3.13 or higher
+- Ninja build system (recommended)
+
+<Warning>
+Do not use a different StableHLO version without testing. Custom passes in microMLC depend on specific APIs that may change between versions.
+</Warning>
+
+## LLVM/MLIR Dependencies
+
+### Build-Time LLVM
+
+**Version**: llvmorg-18.1.8  
+**Repository**: https://github.com/llvm/llvm-project.git  
+**Commit**: `3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff`
+
+This provides the MLIR infrastructure needed to:
+- Build StableHLO from source
+- Compile custom MLIR passes
+- Generate `stablehlo-opt` tool
+
+### MLIR Components Used
+
+The microMLC passes link against these MLIR libraries:
+
+```cmake
+MLIRArithDialect           # Arithmetic operations
+MLIRBufferizationDialect   # Buffer management
+MLIRFuncDialect            # Function operations
+MLIRLinalgDialect          # Linear algebra operations
+MLIRLinalgTransforms       # Linalg transformations
+MLIRMathDialect            # Math operations
+MLIRMemRefDialect          # Memory reference operations
+MLIRSCFDialect             # Structured control flow
+MLIRTensorDialect          # Tensor operations
+MLIRVectorDialect          # Vector operations
+MLIRTransforms             # Core transformation infrastructure
+MLIRTransformUtils         # Transformation utilities
+```
+
+### Build Configuration
+
+LLVM is built with these specific settings:
+
+```bash
+-DLLVM_ENABLE_PROJECTS=mlir      # Only build MLIR
+-DLLVM_TARGETS_TO_BUILD=host     # Only host target (faster builds)
+-DCMAKE_BUILD_TYPE=Release       # Optimized build
+```
+
+<Note>
+Building only the host target significantly reduces build time from ~2 hours to ~45 minutes on typical hardware.
+</Note>
+
+## Runtime Dependencies
+
+### Runtime LLVM
+
+**Version**: 17.0.6  
+**Package**: `llvm@17` (Homebrew)  
+**Install**: `brew install llvm@17`
+
+The runtime LLVM provides:
+- `mlir-cpu-runner`: Tool for executing MLIR IR
+- `mlir-translate`: Conversion between MLIR and LLVM IR
+- Runtime libraries for MLIR execution
+
+### Required Runtime Libraries
+
+When executing compiled IR, these libraries must be available:
+
+```bash
+libmlir_runner_utils.dylib      # Basic MLIR runtime utilities
+libmlir_c_runner_utils.dylib    # C interface runtime utilities  
+libmlir_async_runtime.dylib     # Async execution support
+libomp.dylib                    # OpenMP for parallelization
+```
+
+<Note>
+On Linux, these libraries have `.so` extensions instead of `.dylib`:
+- `libmlir_runner_utils.so`
+- `libmlir_c_runner_utils.so`
+- `libmlir_async_runtime.so`
+- `libomp.so`
+</Note>
+
+### Runtime Library Locations
+
+On macOS with Homebrew:
+
+```bash
+# LLVM binaries
+/opt/homebrew/opt/llvm@17/bin/mlir-cpu-runner
+/opt/homebrew/opt/llvm@17/bin/mlir-translate
+
+# LLVM libraries
+/opt/homebrew/opt/llvm@17/lib/libmlir_runner_utils.dylib
+/opt/homebrew/opt/llvm@17/lib/libmlir_c_runner_utils.dylib
+/opt/homebrew/opt/llvm@17/lib/libmlir_async_runtime.dylib
+
+# OpenMP
+/opt/homebrew/opt/llvm/lib/libomp.dylib
+```
+
+### Linux Alternative
+
+On Linux systems, install LLVM 17 from your package manager:
+
+<CodeGroup>
+
+```bash Ubuntu/Debian
+# Add LLVM repository
+wget https://apt.llvm.org/llvm.sh
+chmod +x llvm.sh
+sudo ./llvm.sh 17
+
+# Install MLIR tools
+sudo apt-get install llvm-17-tools
+```
+
+```bash Fedora/RHEL
+# Install LLVM 17
+sudo dnf install llvm17 llvm17-devel
+
+# Install MLIR runtime
+sudo dnf install mlir17
+```
+
+```bash Arch Linux
+# Install from AUR
+yay -S llvm17
+```
+
+</CodeGroup>
+
+## Python Dependencies
+
+### Python Version
+
+Python 3.7 or higher is required for:
+- IR generation scripts
+- Build helper scripts  
+- Benchmark result processing
+
+### Python Packages
+
+The project uses Python standard library only. No additional packages are required for basic functionality.
+
+For transformer model IR generation:
+
+```bash
+pip install torch numpy  # If generating new transformer IRs
+```
+
+<Note>
+PyTorch is only needed if you're regenerating transformer IR from scratch. Pre-generated IR is included in the `ir/` directory.
+</Note>
+
+## Build Tool Dependencies
+
+### CMake
+
+**Minimum Version**: 3.13  
+**Recommended**: 3.20 or higher
+
+Install on macOS:
+```bash
+brew install cmake
+```
+
+Install on Linux:
+```bash
+sudo apt-get install cmake  # Ubuntu/Debian
+sudo dnf install cmake      # Fedora/RHEL
+```
+
+### Ninja
+
+**Recommended Build System**: Ninja provides faster parallel builds than Make.
+
+Install on macOS:
+```bash
+brew install ninja
+```
+
+Install on Linux:
+```bash
+sudo apt-get install ninja-build  # Ubuntu/Debian
+sudo dnf install ninja-build      # Fedora/RHEL
+```
+
+### Alternative: Make
+
+If Ninja is unavailable, you can use Unix Makefiles:
+
+```bash
+# Replace -G Ninja with -G "Unix Makefiles" in CMake commands
+cmake -S third_party/stablehlo/llvm-project/llvm \
+  -B third_party/stablehlo/llvm-project/build \
+  -G "Unix Makefiles" \
+  ...
+```
+
+<Warning>
+Using Make instead of Ninja will significantly increase build times (2-3x longer).
+</Warning>
+
+## Version Compatibility
+
+### Why These Specific Versions?
+
+1. **StableHLO v0.13.0**: Provides stable APIs for custom pass development
+2. **LLVM 18.1.8**: Required by StableHLO v0.13.0 for building
+3. **LLVM 17.0.6 runtime**: Proven stable for MLIR execution
+
+### Upgrading Dependencies
+
+If you need to upgrade to newer versions:
+
+<Steps>
+
+### Update StableHLO
+
+```bash
+cd third_party/stablehlo
+git fetch
+git checkout <new-commit>
+```
+
+### Verify LLVM Compatibility
+
+Check StableHLO's required LLVM version:
+```bash
+grep "LLVM_PROJECT_COMMIT" third_party/stablehlo/build_tools/integrate/llvm_version.txt
+```
+
+### Update LLVM if Needed
+
+```bash
+cd third_party/stablehlo/llvm-project
+git fetch
+git checkout <new-llvm-commit>
+```
+
+### Rebuild Everything
+
+```bash
+# Clean old builds
+rm -rf third_party/stablehlo/llvm-project/build
+rm -rf third_party/stablehlo/build
+
+# Rebuild (see Building guide)
+```
+
+### Test Custom Passes
+
+```bash
+bash tools/sync_passes.sh
+cmake --build third_party/stablehlo/build -t stablehlo-opt
+bash tools/run_attn_cache_pipeline.sh
+```
+
+</Steps>
+
+<Warning>
+Upgrading dependencies may break custom passes due to API changes. Always test thoroughly after upgrading.
+</Warning>
+
+## Dependency Verification
+
+After installation, verify all dependencies:
+
+```bash
+# Check repositories are at correct commits
+cd third_party/stablehlo
+git rev-parse HEAD  # Should be 75c7095a97c6aaaee15dfab1fac529ce695e1d4a
+
+cd llvm-project
+git rev-parse HEAD  # Should be 3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff
+cd ../..
+
+# Check runtime LLVM
+mlir-cpu-runner --version  # Should show LLVM 17.x
+
+# Check runtime libraries exist
+ls $(brew --prefix llvm@17)/lib/libmlir_*.dylib
+```
+
+## Troubleshooting
+
+### CMake Cannot Find LLVM
+
+If CMake cannot locate LLVM:
+
+```bash
+# Set LLVM_DIR explicitly
+export LLVM_DIR="$(pwd)/third_party/stablehlo/llvm-project/build/lib/cmake/llvm"
+export MLIR_DIR="$(pwd)/third_party/stablehlo/llvm-project/build/lib/cmake/mlir"
+```
+
+### Runtime Library Not Found
+
+If execution fails with library errors:
+
+```bash
+# On macOS, add LLVM to library path
+export DYLD_LIBRARY_PATH="$(brew --prefix llvm@17)/lib:$DYLD_LIBRARY_PATH"
+
+# On Linux
+export LD_LIBRARY_PATH="/usr/lib/llvm-17/lib:$LD_LIBRARY_PATH"
+```
+
+### Version Mismatch Errors
+
+If you see version mismatch errors during linking:
+
+```bash
+# Verify you're using the correct LLVM
+which mlir-cpu-runner
+mlir-cpu-runner --version
+
+# Ensure paths are correct
+echo $PATH | grep llvm
+```

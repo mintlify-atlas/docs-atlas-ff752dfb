@@ -1,0 +1,638 @@
+---
+title: 'IR Transformation Stages'
+description: 'Detailed explanation of each IR transformation stage with examples'
+---
+
+## Introduction
+
+This document provides an in-depth analysis of how IR transforms through the microMLC pipeline. Each section shows actual IR snippets from the `ir/` directory, highlighting the key changes at each stage.
+
+## Input: StableHLO (`attn_complete.mlir`)
+
+### Characteristics
+
+- **171 lines** of high-level ML operations
+- Uses `stablehlo`, `linalg`, `tensor`, `arith`, and `math` dialects
+- Explicit affine maps for transpose operations
+- Named operations: `linalg.matmul`, `linalg.batch_matmul`, `linalg.generic`
+
+### Key Operations
+
+#### Linear Projections
+
+```mlir
+// Collapse 3D inputs to 2D for matrix multiplication
+%in_flat = tensor.collapse_shape %arg0 [[0, 1], [2]] 
+  : tensor<1x128x128xf32> into tensor<128x128xf32>
+%w_q_flat = tensor.collapse_shape %arg1 [[0, 1], [2]] 
+  : tensor<1x128x128xf32> into tensor<128x128xf32>
+
+%init_proj = tensor.empty() : tensor<128x128xf32>
+
+// Q, K, V projections (3 separate matmuls)
+%q_proj = linalg.matmul 
+  ins(%in_flat, %w_q_flat : tensor<128x128xf32>, tensor<128x128xf32>) 
+  outs(%init_proj : tensor<128x128xf32>) -> tensor<128x128xf32>
+
+%k_proj = linalg.matmul 
+  ins(%in_flat, %w_k_flat : tensor<128x128xf32>, tensor<128x128xf32>) 
+  outs(%init_proj : tensor<128x128xf32>) -> tensor<128x128xf32>
+
+%v_proj = linalg.matmul 
+  ins(%in_flat, %w_v_flat : tensor<128x128xf32>, tensor<128x128xf32>) 
+  outs(%init_proj : tensor<128x128xf32>) -> tensor<128x128xf32>
+```
+
+**Analysis**: Three independent 128×128 matmuls. Perfect candidates for tiling and parallel execution.
+
+#### Head Splitting with Transposes
+
+```mlir
+#map_transpose_q = affine_map<(d0, d1, d2, d3) -> (d0, d2, d1, d3)>
+#map_identity_4d = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+
+// Reshape: 128×128 → 1×128×4×32 (split into 4 heads)
+%q_expanded = tensor.expand_shape %q_proj [[0, 1], [2, 3]] 
+  : tensor<128x128xf32> into tensor<1x128x4x32xf32>
+
+%init_heads = tensor.empty() : tensor<1x4x128x32xf32>
+
+// Transpose: (B, S, H, D) → (B, H, S, D)
+%q_heads = linalg.generic {
+    indexing_maps = [#map_transpose_q, #map_identity_4d],
+    iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+} ins(%q_expanded : tensor<1x128x4x32xf32>) 
+  outs(%init_heads : tensor<1x4x128x32xf32>) {
+    ^bb0(%in: f32, %out: f32): 
+      linalg.yield %in : f32
+} -> tensor<1x4x128x32xf32>
+```
+
+**Analysis**: Pure data movement operations. Candidates for fusion with subsequent computations or elimination via layout optimization.
+
+#### Attention Scores
+
+```mlir
+// Collapse to 3D for batch matmul
+%q_flat = tensor.collapse_shape %q_heads [[0, 1], [2], [3]] 
+  : tensor<1x4x128x32xf32> into tensor<4x128x32xf32>
+%k_flat = tensor.collapse_shape %k_heads_T [[0, 1], [2], [3]] 
+  : tensor<1x4x32x128xf32> into tensor<4x32x128xf32>
+
+%scores_init = tensor.empty() : tensor<4x128x128xf32>
+
+// Batch matmul: Q @ K^T for 4 heads
+%scores = linalg.batch_matmul 
+  ins(%q_flat, %k_flat : tensor<4x128x32xf32>, tensor<4x32x128xf32>)
+  outs(%scores_init : tensor<4x128x128xf32>) -> tensor<4x128x128xf32>
+
+// Scaling
+%scaled = linalg.generic {
+    indexing_maps = [#map_identity_3d, #map_identity_3d],
+    iterator_types = ["parallel", "parallel", "parallel"]
+} ins(%scores : tensor<4x128x128xf32>) 
+  outs(%scaled_init : tensor<4x128x128xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %res = arith.mulf %in, %cst_scale : f32
+    linalg.yield %res : f32
+} -> tensor<4x128x128xf32>
+```
+
+**Analysis**: Batch matmul followed by elementwise scaling. The scaling operation is a prime fusion candidate.
+
+#### Softmax
+
+```mlir
+#map_identity_3d = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#map_reduce_3d_2d = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+// Max reduction
+%max_init = tensor.empty() : tensor<4x128xf32>
+%max_fill = linalg.fill ins(%cst_neg_inf : f32) 
+                        outs(%max_init : tensor<4x128xf32>) -> tensor<4x128xf32>
+%max = linalg.generic {
+    indexing_maps = [#map_identity_3d, #map_reduce_3d_2d],
+    iterator_types = ["parallel", "parallel", "reduction"]
+} ins(%scaled : tensor<4x128x128xf32>) 
+  outs(%max_fill : tensor<4x128xf32>) {
+  ^bb0(%in: f32, %acc: f32):
+    %gt = arith.cmpf ogt, %in, %acc : f32
+    %sel = arith.select %gt, %in, %acc : f32
+    linalg.yield %sel : f32
+} -> tensor<4x128xf32>
+
+// Exp with broadcasting
+%exp = linalg.generic {
+    indexing_maps = [#map_identity_3d, #map_reduce_3d_2d, #map_identity_3d],
+    iterator_types = ["parallel", "parallel", "parallel"]
+} ins(%scaled, %max : tensor<4x128x128xf32>, tensor<4x128xf32>) 
+  outs(%exp_init : tensor<4x128x128xf32>) {
+  ^bb0(%in: f32, %in_max: f32, %out: f32):
+    %sub = arith.subf %in, %in_max : f32
+    %res = math.exp %sub : f32
+    linalg.yield %res : f32
+} -> tensor<4x128x128xf32>
+
+// Sum reduction
+%sum = linalg.generic {
+    indexing_maps = [#map_identity_3d, #map_reduce_3d_2d],
+    iterator_types = ["parallel", "parallel", "reduction"]
+} ins(%exp : tensor<4x128x128xf32>) 
+  outs(%sum_fill : tensor<4x128xf32>) {
+  ^bb0(%in: f32, %acc: f32):
+    %add = arith.addf %in, %acc : f32
+    linalg.yield %add : f32
+} -> tensor<4x128xf32>
+
+// Division (normalization)
+%probs = linalg.generic {
+    indexing_maps = [#map_identity_3d, #map_reduce_3d_2d, #map_identity_3d],
+    iterator_types = ["parallel", "parallel", "parallel"]
+} ins(%exp, %sum : tensor<4x128x128xf32>, tensor<4x128xf32>) 
+  outs(%prob_init : tensor<4x128x128xf32>) {
+  ^bb0(%in: f32, %in_sum: f32, %out: f32):
+    %div = arith.divf %in, %in_sum : f32
+    linalg.yield %div : f32
+} -> tensor<4x128x128xf32>
+```
+
+**Analysis**: Softmax implemented as 4 separate operations (max, exp, sum, div). Stage 1 fusion will combine these into 3 ops, then 2 ops.
+
+---
+
+## Stage 0: After Tiling (`attn_stage0_linalg.mlir`)
+
+### Changes from Input
+
+- **Unchanged**: Most operations remain the same
+- **Simplified maps**: Affine maps consolidated
+- **Line count**: 84 lines (down from 171)
+
+### Key Transformation
+
+<Tabs>
+  <Tab title="Input (StableHLO)">
+```mlir
+%q_proj = linalg.matmul 
+  ins(%in_flat, %w_q_flat : tensor<128x128xf32>, tensor<128x128xf32>) 
+  outs(%init_proj : tensor<128x128xf32>) -> tensor<128x128xf32>
+```
+  </Tab>
+  <Tab title="Stage 0 (Linalg)">
+```mlir
+// Same operation - no visible change at this stage
+%1 = linalg.matmul 
+  ins(%collapsed, %collapsed_2 : tensor<128x128xf32>, tensor<128x128xf32>) 
+  outs(%0 : tensor<128x128xf32>) -> tensor<128x128xf32>
+```
+  </Tab>
+</Tabs>
+
+**Note**: The tiling pass primarily normalizes the IR and prepares for subsequent stages. The actual 4×4 tiling occurs in Stage 2.
+
+---
+
+## Stage 1: After Fusion (`attn_stage1_fused.mlir`)
+
+### Changes from Stage 0
+
+- **Fused operations**: Softmax operations combined
+- **Fewer intermediate tensors**: 3 operations eliminated
+- **Line count**: 88 lines (slight increase due to fused body complexity)
+
+### Fusion Example 1: Scale + Exp
+
+<Tabs>
+  <Tab title="Stage 0 (Separate)">
+```mlir
+// Separate scaling
+%11 = linalg.generic {
+    indexing_maps = [#map3, #map3],
+    iterator_types = ["parallel", "parallel", "parallel"]
+} ins(%10 : tensor<4x128x128xf32>) 
+  outs(%9 : tensor<4x128x128xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    %23 = arith.mulf %in, %cst_1 : f32
+    linalg.yield %23 : f32
+} -> tensor<4x128x128xf32>
+
+// Separate exp
+%15 = linalg.generic {
+    indexing_maps = [#map3, #map4, #map3],
+    iterator_types = ["parallel", "parallel", "parallel"]
+} ins(%11, %14 : tensor<4x128x128xf32>, tensor<4x128xf32>) 
+  outs(%9 : tensor<4x128x128xf32>) {
+  ^bb0(%in: f32, %in_12: f32, %out: f32):
+    %23 = arith.subf %in, %in_12 : f32
+    %24 = math.exp %23 : f32
+    linalg.yield %24 : f32
+} -> tensor<4x128x128xf32>
+```
+  </Tab>
+  <Tab title="Stage 1 (Fused)">
+```mlir
+// Fused scale + exp
+%15 = linalg.generic {
+    indexing_maps = [#map3, #map4, #map3],
+    iterator_types = ["parallel", "parallel", "parallel"]
+} ins(%10, %14 : tensor<4x128x128xf32>, tensor<4x128xf32>) 
+  outs(%9 : tensor<4x128x128xf32>) {
+  ^bb0(%in: f32, %in_12: f32, %out: f32):
+    %23 = arith.mulf %in, %cst_1 : f32    // From first op
+    %24 = arith.subf %23, %in_12 : f32     // From second op
+    %25 = math.exp %24 : f32               // From second op
+    linalg.yield %25 : f32
+} -> tensor<4x128x128xf32>
+```
+  </Tab>
+</Tabs>
+
+**Benefits**:
+- Eliminates `%11` intermediate tensor
+- Reads `%10` once instead of twice
+- Reduces memory bandwidth by ~33%
+
+### Fusion Example 2: Scale + Exp + Div
+
+<Tabs>
+  <Tab title="Stage 0 (Separate)">
+```mlir
+// Three separate operations:
+
+// 1. Scale
+%11 = linalg.generic {...} ins(%10 : tensor<4x128x128xf32>) {...}
+
+// 2. Exp
+%15 = linalg.generic {...} ins(%11, %14 : tensor<4x128x128xf32>, tensor<4x128xf32>) {...}
+
+// 3. Div
+%18 = linalg.generic {
+    indexing_maps = [#map3, #map4, #map3],
+    iterator_types = ["parallel", "parallel", "parallel"]
+} ins(%15, %17 : tensor<4x128x128xf32>, tensor<4x128xf32>) 
+  outs(%9 : tensor<4x128x128xf32>) {
+  ^bb0(%in: f32, %in_sum: f32, %out: f32):
+    %23 = arith.divf %in, %in_sum : f32
+    linalg.yield %23 : f32
+} -> tensor<4x128x128xf32>
+```
+  </Tab>
+  <Tab title="Stage 1 (Fully Fused)">
+```mlir
+// Single fused operation:
+%18 = linalg.generic {
+    indexing_maps = [#map3, #map4, #map4, #map3],
+    iterator_types = ["parallel", "parallel", "parallel"]
+} ins(%10, %14, %17 : tensor<4x128x128xf32>, tensor<4x128xf32>, tensor<4x128xf32>) 
+  outs(%9 : tensor<4x128x128xf32>) {
+  ^bb0(%in: f32, %in_12: f32, %in_13: f32, %out: f32):
+    %23 = arith.mulf %in, %cst_1 : f32      // Scale
+    %24 = arith.subf %23, %in_12 : f32       // Subtract max
+    %25 = math.exp %24 : f32                 // Exp
+    %26 = arith.divf %25, %in_13 : f32       // Normalize
+    linalg.yield %26 : f32
+} -> tensor<4x128x128xf32>
+```
+  </Tab>
+</Tabs>
+
+**Benefits**:
+- **Softmax now 3 ops instead of 5**: max, sum, fused(scale+exp+div)
+- Single pass over attention scores
+- 4 memory reads → 1 memory read
+- Critical for performance: softmax is memory-bound
+
+---
+
+## Stage 2: After Cache Tiling (`attn_stage2_tiled_tensor.mlir`)
+
+### Changes from Stage 1
+
+- **Nested loop structures**: 6-level loop nests for matmuls
+- **Tile sizes**: L2=64×64×64, L1=4×4×4
+- **Line count**: 17,731 lines (200× expansion!)
+
+### Tiled Matmul Structure
+
+```mlir
+%c0 = arith.constant 0 : index
+%c128 = arith.constant 128 : index
+%c64 = arith.constant 64 : index
+%c4 = arith.constant 4 : index
+
+%0 = tensor.empty() : tensor<128x128xf32>
+
+// L2 M loop (0, 64, 128)
+%1 = scf.for %arg4 = %c0 to %c128 step %c64 iter_args(%arg5 = %0) -> (tensor<128x128xf32>) {
+  
+  // L2 N loop
+  %23 = scf.for %arg6 = %c0 to %c128 step %c64 iter_args(%arg7 = %arg5) -> (tensor<128x128xf32>) {
+    
+    // L2 K loop (reduction)
+    %24 = scf.for %arg8 = %c0 to %c128 step %c64 iter_args(%arg9 = %arg7) -> (tensor<128x128xf32>) {
+      
+      // Extract 64x64 tiles
+      %extracted_slice = tensor.extract_slice %collapsed[%arg4, %arg8] [64, 64] [1, 1] 
+        : tensor<128x128xf32> to tensor<64x64xf32>
+      %extracted_slice_12 = tensor.extract_slice %collapsed_2[%arg8, %arg6] [64, 64] [1, 1] 
+        : tensor<128x128xf32> to tensor<64x64xf32>
+      %extracted_slice_13 = tensor.extract_slice %arg9[%arg4, %arg6] [64, 64] [1, 1] 
+        : tensor<128x128xf32> to tensor<64x64xf32>
+      
+      // L1 M loop (0, 4, 8, ..., 60)
+      %25 = scf.for %arg10 = %c0 to %c64 step %c4 iter_args(%arg11 = %extracted_slice_13) -> (tensor<64x64xf32>) {
+        
+        // L1 N loop
+        %26 = scf.for %arg12 = %c0 to %c64 step %c4 iter_args(%arg13 = %arg11) -> (tensor<64x64xf32>) {
+          
+          // L1 K loop
+          %27 = scf.for %arg14 = %c0 to %c64 step %c4 iter_args(%arg15 = %arg13) -> (tensor<64x64xf32>) {
+            
+            // Extract 4x4 tiles
+            %extracted_slice_14 = tensor.extract_slice %extracted_slice[%arg10, %arg14] [4, 4] [1, 1] 
+              : tensor<64x64xf32> to tensor<4x4xf32>
+            %extracted_slice_15 = tensor.extract_slice %extracted_slice_12[%arg14, %arg12] [4, 4] [1, 1] 
+              : tensor<64x64xf32> to tensor<4x4xf32>
+            %extracted_slice_16 = tensor.extract_slice %arg15[%arg10, %arg12] [4, 4] [1, 1] 
+              : tensor<64x64xf32> to tensor<4x4xf32>
+            
+            // Core computation: 4x4 matmul
+            %28 = linalg.matmul {done_tiling} 
+              ins(%extracted_slice_14, %extracted_slice_15 : tensor<4x4xf32>, tensor<4x4xf32>) 
+              outs(%extracted_slice_16 : tensor<4x4xf32>) -> tensor<4x4xf32>
+            
+            // Insert result back
+            %inserted_slice_17 = tensor.insert_slice %28 into %arg15[%arg10, %arg12] [4, 4] [1, 1] 
+              : tensor<4x4xf32> into tensor<64x64xf32>
+            
+            scf.yield %inserted_slice_17 : tensor<64x64xf32>
+          } {done_tiling}
+          scf.yield %27 : tensor<64x64xf32>
+        } {done_tiling}
+        scf.yield %26 : tensor<64x64xf32>
+      } {done_tiling}
+      
+      %inserted_slice = tensor.insert_slice %25 into %arg9[%arg4, %arg6] [64, 64] [1, 1] 
+        : tensor<64x64xf32> into tensor<128x128xf32>
+      scf.yield %inserted_slice : tensor<128x128xf32>
+    } {done_tiling}
+    scf.yield %24 : tensor<128x128xf32>
+  } {done_tiling}
+  scf.yield %23 : tensor<128x128xf32>
+} {done_tiling}
+```
+
+### Cache Behavior
+
+**L2 Cache (64×64 tiles)**:
+- A tile: 64×64×4 bytes = 16KB
+- B tile: 64×64×4 bytes = 16KB  
+- C tile: 64×64×4 bytes = 16KB
+- **Total**: 48KB fits comfortably in 256KB L2
+- Each L2 tile reused 16× (64/4) by L1 loops
+
+**L1 Cache (4×4 tiles)**:
+- A tile: 4×4×4 bytes = 64 bytes
+- B tile: 4×4×4 bytes = 64 bytes
+- C tile: 4×4×4 bytes = 64 bytes
+- **Total**: 192 bytes (trivial for 32KB L1)
+- Each element accessed once per K-loop iteration
+
+---
+
+## Stage 3: After Bufferization (`attn_stage3_bufferized.mlir`)
+
+### Changes from Stage 2
+
+- **Tensor → MemRef**: All tensor types converted
+- **Explicit allocation**: `memref.alloc()` calls inserted
+- **In-place updates**: `tensor.insert_slice` eliminated
+- **Line count**: 17,961 lines (similar to Stage 2)
+
+### Bufferization Example
+
+<Tabs>
+  <Tab title="Stage 2 (Tensor)">
+```mlir
+// Allocate tensor
+%0 = tensor.empty() : tensor<128x128xf32>
+
+// Loop with SSA-style iter_args
+%1 = scf.for %arg4 = %c0 to %c128 step %c64 iter_args(%arg5 = %0) -> (tensor<128x128xf32>) {
+  %23 = scf.for %arg6 = %c0 to %c128 step %c64 iter_args(%arg7 = %arg5) -> (tensor<128x128xf32>) {
+    
+    // Extract tensor slice
+    %extracted_slice = tensor.extract_slice %collapsed[%arg4, %arg8] [64, 64] [1, 1] 
+      : tensor<128x128xf32> to tensor<64x64xf32>
+    
+    // Matmul on tensors
+    %28 = linalg.matmul 
+      ins(%extracted_slice_14, %extracted_slice_15 : tensor<4x4xf32>, tensor<4x4xf32>) 
+      outs(%extracted_slice_16 : tensor<4x4xf32>) -> tensor<4x4xf32>
+    
+    // Insert result back (creates new tensor)
+    %inserted_slice = tensor.insert_slice %28 into %arg15[%arg10, %arg12] [4, 4] [1, 1] 
+      : tensor<4x4xf32> into tensor<64x64xf32>
+    
+    scf.yield %inserted_slice : tensor<64x64xf32>
+  }
+  scf.yield %23 : tensor<128x128xf32>
+}
+```
+  </Tab>
+  <Tab title="Stage 3 (MemRef)">
+```mlir
+// Allocate memory with alignment
+%alloc_8 = memref.alloc() {alignment = 64 : i64} : memref<128x128xf32>
+
+// Loop without iter_args (in-place mutation)
+scf.for %arg4 = %c0 to %c128 step %c64 {
+  scf.for %arg5 = %c0 to %c128 step %c64 {
+    
+    // Create view into memory
+    %subview = memref.subview %collapse_shape[%arg4, %arg6] [64, 64] [1, 1] 
+      : memref<128x128xf32> to memref<64x64xf32, strided<[128, 1], offset: ?>>
+    
+    // Matmul directly on memory
+    linalg.matmul {done_tiling} 
+      ins(%subview_29, %subview_30 : 
+           memref<4x4xf32, strided<[128, 1], offset: ?>>, 
+           memref<4x4xf32, strided<[128, 1], offset: ?>>) 
+      outs(%subview_31 : memref<4x4xf32, strided<[128, 1], offset: ?>>)
+    
+    // No insert_slice needed - already written to memory
+    memref.copy %subview_31, %subview_31  // Often optimized away
+  }
+}
+```
+  </Tab>
+</Tabs>
+
+### Memory Layout
+
+**Strided MemRef**:
+```mlir
+memref<4x4xf32, strided<[128, 1], offset: ?>>
+```
+- **Shape**: 4×4
+- **Stride**: [128, 1] (row-major, 128 elements per row in parent)
+- **Offset**: Dynamic (depends on subview origin)
+
+**Address Calculation**:
+```
+address(i, j) = base + offset + i * 128 + j * 1
+```
+
+This allows zero-copy slicing of the parent buffer.
+
+---
+
+## Stage 5: After Vectorization (`attn_stage5_vectorized.mlir`)
+
+### Changes from Stage 3
+
+- **Vector operations**: `linalg.matmul` → `vector.contract`
+- **SIMD loads/stores**: `vector.transfer_read`, `vector.transfer_write`
+- **Broadcasting**: Affine maps for data replication
+- **Line count**: 20,306 lines (expanded due to vector ops)
+
+### Vectorized Matmul
+
+<Tabs>
+  <Tab title="Stage 3 (Scalar)">
+```mlir
+linalg.matmul {done_tiling} 
+  ins(%subview_29, %subview_30 : 
+       memref<4x4xf32, strided<[128, 1], offset: ?>>, 
+       memref<4x4xf32, strided<[128, 1], offset: ?>>) 
+  outs(%subview_31 : memref<4x4xf32, strided<[128, 1], offset: ?>>)
+
+// Conceptual scalar lowering:
+// for i in 0..4:
+//   for j in 0..4:
+//     for k in 0..4:
+//       C[i,j] += A[i,k] * B[k,j]
+```
+  </Tab>
+  <Tab title="Stage 5 (Vector)">
+```mlir
+#map = affine_map<(d0, d1) -> (d0, 0, d1)>  // A: broadcast middle dim
+#map1 = affine_map<(d0, d1) -> (0, d1, d0)> // B: broadcast first dim
+#map2 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#map3 = affine_map<(d0, d1, d2) -> (d0, d1)>
+
+// Load A with broadcasting: 4×4 → 4×4×4 vector
+%0 = vector.transfer_read %subview_29[%c0, %c0], %cst 
+  {in_bounds = [true, true, true], permutation_map = #map} 
+  : memref<4x4xf32, strided<[128, 1], offset: ?>>, vector<4x4x4xf32>
+// Result: A[i,k] replicated as vector[i, _, k] for all j
+
+// Load B with broadcasting: 4×4 → 4×4×4 vector
+%1 = vector.transfer_read %subview_30[%c0, %c0], %cst 
+  {in_bounds = [true, true, true], permutation_map = #map1} 
+  : memref<4x4xf32, strided<[128, 1], offset: ?>>, vector<4x4x4xf32>
+// Result: B[k,j] replicated as vector[_, j, k] for all i
+
+// Load accumulator: 4×4 → 4×4 vector
+%2 = vector.transfer_read %subview_31[%c0, %c0], %cst 
+  {in_bounds = [true, true]} 
+  : memref<4x4xf32, strided<[128, 1], offset: ?>>, vector<4x4xf32>
+
+// Vector contraction (FMA over k dimension)
+%3 = vector.contract {
+  indexing_maps = [#map2, #map2, #map3],
+  iterator_types = ["parallel", "parallel", "reduction"],
+  kind = #vector.kind<add>
+} %0, %1, %2 : vector<4x4x4xf32>, vector<4x4x4xf32> into vector<4x4xf32>
+// Computes: C[i,j] += sum_k(A[i,k] * B[k,j]) for all i,j
+
+// Store result: 4×4 vector → memory
+vector.transfer_write %3, %subview_31[%c0, %c0] 
+  {in_bounds = [true, true]} 
+  : vector<4x4xf32>, memref<4x4xf32, strided<[128, 1], offset: ?>>
+```
+  </Tab>
+</Tabs>
+
+### Vector Broadcasting
+
+The key insight is how matrices are broadcast to 3D vectors:
+
+**Matrix A** (4×4):
+```
+A = [ a00 a01 a02 a03 ]
+    [ a10 a11 a12 a13 ]
+    [ a20 a21 a22 a23 ]
+    [ a30 a31 a32 a33 ]
+```
+
+**Broadcast to vector\<4x4x4\>** via `#map = (d0, d1) -> (d0, 0, d1)`:
+```
+vec_A[i][j][k] = A[i][k]  for all j in 0..4
+
+= [ [[a00, a01, a02, a03], [a00, a01, a02, a03], [a00, a01, a02, a03], [a00, a01, a02, a03]],
+    [[a10, a11, a12, a13], [a10, a11, a12, a13], [a10, a11, a12, a13], [a10, a11, a12, a13]],
+    [[a20, a21, a22, a23], [a20, a21, a22, a23], [a20, a21, a22, a23], [a20, a21, a22, a23]],
+    [[a30, a31, a32, a33], [a30, a31, a32, a33], [a30, a31, a32, a33], [a30, a31, a32, a33]] ]
+```
+
+**Matrix B** (4×4):
+```
+B = [ b00 b01 b02 b03 ]
+    [ b10 b11 b12 b13 ]
+    [ b20 b21 b22 b23 ]
+    [ b30 b31 b32 b33 ]
+```
+
+**Broadcast to vector\<4x4x4\>** via `#map1 = (d0, d1) -> (0, d1, d0)`:
+```
+vec_B[i][j][k] = B[k][j]  for all i in 0..4
+```
+
+Now `vector.contract` computes:
+```
+C[i][j] = sum_k(vec_A[i][j][k] * vec_B[i][j][k])
+        = sum_k(A[i][k] * B[k][j])
+```
+
+This is exactly matrix multiplication!
+
+### SIMD Code Generation
+
+The vector operations lower to x86-64 assembly:
+
+```asm
+; Load A row with broadcast
+vbroadcastss zmm0, [rax + 0]    ; Load a[0,0] into all lanes
+vbroadcastss zmm1, [rax + 4]    ; Load a[0,1] into all lanes
+...
+
+; Load B column
+vmovups zmm16, [rbx + 0]         ; Load b[0,0..15]
+
+; FMA (fused multiply-add)
+vfmadd231ps zmm31, zmm0, zmm16   ; c[0..15] += a[0,0] * b[0,0..15]
+...
+
+; Store result
+vmovups [rcx + 0], zmm31
+```
+
+Each `vector.contract` becomes a tight loop of FMA instructions, processing 4-16 elements per cycle.
+
+## Summary of Transformations
+
+| Stage | Lines | Key Operations | Memory Model | Parallelism |
+|-------|-------|----------------|--------------|-------------|
+| **Input** | 171 | `linalg.matmul`, `linalg.generic` | Tensors (immutable) | Implicit |
+| **Stage 0** | 84 | Same as input | Tensors | Implicit |
+| **Stage 1** | 88 | Fused generics | Tensors | Implicit |
+| **Stage 2** | 17,731 | `scf.for` nests, `tensor.extract_slice` | Tensors | Explicit loops |
+| **Stage 3** | 17,961 | `scf.for` nests, `memref.subview` | MemRefs (mutable) | Explicit loops |
+| **Stage 5** | 20,306 | `vector.contract`, `vector.transfer_*` | MemRefs | SIMD vectors |
+
+## Related Documentation
+
+- [Architecture Overview](/architecture/overview) - Design principles
+- [Pipeline Details](/architecture/pipeline) - Complete pipeline walkthrough
+- [Performance Analysis](/guides/benchmarking) - Measuring optimization impact

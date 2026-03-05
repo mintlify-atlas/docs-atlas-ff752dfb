@@ -1,0 +1,633 @@
+---
+title: Debugging MLIR Passes
+description: Techniques and tools for debugging custom MLIR passes in microMLC
+---
+
+## Overview
+
+Debugging MLIR passes requires understanding both the MLIR infrastructure and compiler-specific techniques. This guide covers debugging strategies used in microMLC development.
+
+## Quick Debugging Checklist
+
+1. **Enable verbose output**: Many passes have `-verbose` flags
+2. **Dump IR at each stage**: Use `-o stage_N.mlir` between passes
+3. **Check verifier errors**: MLIR automatically validates IR
+4. **Use `llvm::errs()`**: Print debug messages to stderr
+5. **Run with single-threaded execution**: Avoid race conditions
+6. **Bisect the pipeline**: Narrow down which pass fails
+
+## MLIR Debugging Tools
+
+### 1. IR Printing and Inspection
+
+#### Print IR Between Passes
+
+The most effective debugging technique is inspecting IR at each pipeline stage:
+
+```bash
+# From tools/run_attn_cache_pipeline.sh
+stablehlo-opt input.mlir \
+  -stablehlo-tiling \
+  -o stage0.mlir          # Checkpoint after first pass
+
+stablehlo-opt stage0.mlir \
+  -generic-fusion \
+  -o stage1.mlir          # Checkpoint after second pass
+```
+
+#### Print Specific Operations
+
+In your pass code:
+
+```cpp
+// Print operation structure
+llvm::errs() << "Processing: " << *op << "\n";
+
+// Print with location info
+op->print(llvm::errs(), mlir::OpPrintingFlags().printGenericOpForm());
+llvm::errs() << "\n";
+
+// Print operation type
+llvm::errs() << "Op name: " << op->getName().getStringRef() << "\n";
+```
+
+#### Example from ToyVectorizationPass.cpp:38-41
+
+```cpp
+static void logDecision(bool verbose, Operation *op, StringRef msg) {
+  if (!verbose) return;
+  llvm::errs() << "[toy-vectorize] " << msg << "\n  op: " << *op << "\n";
+}
+```
+
+### 2. Pass Verbosity Flags
+
+Add verbose logging to your pass:
+
+```cpp
+struct MyPass : public PassWrapper<MyPass, OperationPass<func::FuncOp>> {
+  Option<bool> verbose{
+    *this, "verbose",
+    llvm::cl::desc("Print decisions"),
+    llvm::cl::init(false)
+  };
+
+  void runOnOperation() override {
+    if (verbose) {
+      llvm::errs() << "[MyPass] Starting on function: "
+                   << getOperation().getName() << "\n";
+    }
+  }
+};
+```
+
+**Usage:**
+```bash
+stablehlo-opt -my-pass="verbose" input.mlir
+```
+
+### 3. MLIR Verifier
+
+MLIR automatically verifies IR correctness after each pass. Common errors:
+
+#### Type Mismatches
+
+```
+error: 'arith.addf' op operand type mismatch: expected operand type 'f32', 
+but provided 'f64' for operand number 0
+```
+
+**Debug approach:**
+- Check operand types before creating ops
+- Use `assert()` to validate assumptions
+
+```cpp
+assert(lhs.getType() == rhs.getType() && "Operand type mismatch");
+```
+
+#### Invalid Indexing Maps
+
+From `ToyVectorizationPass.cpp:836-882`, transfer ops have strict verification rules:
+
+```
+error: 'vector.transfer_read' op permutation_map has incorrect number of dimensions
+  expected: 2 (source rank)
+  got: 3
+```
+
+**Fix:** Ensure `map.numDims == sourceRank` and `map.numResults == vectorRank`.
+
+### 4. Debug Macros
+
+#### Enable Debug Output
+
+From `ToyVectorizationPass.cpp:25`:
+
+```cpp
+#define DEBUG_TYPE "toy-vectorize"
+
+LLVM_DEBUG(llvm::dbgs() << "[toy-vectorize] Checking legality\n");
+```
+
+**Enable at runtime:**
+```bash
+stablehlo-opt -debug-only=toy-vectorize input.mlir
+```
+
+**Multiple debug types:**
+```bash
+stablehlo-opt -debug-only=toy-vectorize,generic-fusion input.mlir
+```
+
+### 5. Operation Walkers
+
+Inspect all operations of a type:
+
+```cpp
+getOperation().walk([&](linalg::GenericOp op) {
+  llvm::errs() << "Found GenericOp at " << op.getLoc() << "\n";
+  llvm::errs() << "  Inputs: " << op.getNumDpsInputs() << "\n";
+  llvm::errs() << "  Outputs: " << op.getNumDpsInits() << "\n";
+});
+```
+
+### 6. Conditional Breakpoints in GDB/LLDB
+
+Set breakpoints on specific operations:
+
+```bash
+# Build with debug symbols
+cmake -DCMAKE_BUILD_TYPE=Debug ...
+
+# Run under debugger
+lldb -- stablehlo-opt input.mlir -my-pass
+
+# Break on operation creation
+(lldb) breakpoint set -n "mlir::OpBuilder::create"
+
+# Break on specific op type
+(lldb) breakpoint set -f MyPass.cpp -l 42
+(lldb) condition 1 strcmp(op->getName().getStringRef().data(), "linalg.matmul") == 0
+```
+
+## Common Issues and Solutions
+
+### Issue 1: Infinite Recursion
+
+**Symptom:** Pass hangs or crashes with stack overflow.
+
+**Cause:** Pattern creates ops that match the same pattern.
+
+**Example from TilingPass.cpp:31-35:**
+
+```cpp
+LogicalResult matchAndRewrite(stablehlo::DotGeneralOp op, 
+                              PatternRewriter &rewriter) const override {
+  // === RECURSION GUARD ===
+  if (op->hasAttr("done_tiling")) {
+    return failure();  // Skip already-tiled ops
+  }
+
+  // ... perform tiling ...
+
+  // === MARK AS PROCESSED ===
+  partialOp->setAttr("done_tiling", rewriter.getUnitAttr());
+```
+
+**Debug technique:**
+1. Add counters to detect loops:
+   ```cpp
+   static int counter = 0;
+   if (++counter > 1000) {
+     llvm::errs() << "ERROR: Pattern applied >1000 times\n";
+     return failure();
+   }
+   ```
+
+2. Limit pattern iterations:
+   ```cpp
+   GreedyRewriteConfig config;
+   config.maxIterations = 10;  // From GenericFusionPass.cpp:250
+   applyPatternsAndFoldGreedily(getOperation(), std::move(patterns), config);
+   ```
+
+### Issue 2: Verification Failures
+
+**Symptom:** 
+```
+error: 'linalg.generic' op expected the number of results (0) to be equal to 
+the number of output tensors (1)
+```
+
+**Debug approach:**
+
+1. Print operation before verification:
+   ```cpp
+   llvm::errs() << "Created op: " << *newOp << "\n";
+   if (failed(mlir::verify(newOp))) {
+     llvm::errs() << "VERIFICATION FAILED\n";
+     return failure();
+   }
+   ```
+
+2. Check operand/result counts:
+   ```cpp
+   llvm::errs() << "Operands: " << op->getNumOperands() << "\n";
+   llvm::errs() << "Results: " << op->getNumResults() << "\n";
+   ```
+
+### Issue 3: Pattern Not Matching
+
+**Symptom:** Pass completes but IR unchanged.
+
+**Debug from GenericFusionPass.cpp:197-203:**
+
+```cpp
+if (succeeded(fuseProducerEpilogue(producer, consumer, *input, rewriter))) {
+  // Print BEFORE invalidating the consumer op
+  llvm::errs() << "[Fusion Debug] SUCCESS: Fused " 
+               << producer->getName().getStringRef() 
+               << " into " << consumer->getName().getStringRef() << "\n";
+  return success();
+}
+```
+
+**Debugging checklist:**
+
+1. Verify pattern is registered:
+   ```cpp
+   llvm::errs() << "Registering MyPattern\n";
+   patterns.add<MyPattern>(ctx);
+   ```
+
+2. Add logging in `matchAndRewrite`:
+   ```cpp
+   LogicalResult matchAndRewrite(...) const override {
+     llvm::errs() << "Pattern invoked on: " << *op << "\n";
+     
+     if (condition1) {
+       llvm::errs() << "  Failed: condition1\n";
+       return failure();
+     }
+     
+     llvm::errs() << "  Match succeeded\n";
+     // ... rewrite ...
+   }
+   ```
+
+3. Check pattern benefit:
+   ```cpp
+   // Higher benefit = higher priority
+   struct MyPattern : public OpRewritePattern<MyOp> {
+     MyPattern(MLIRContext *ctx) 
+       : OpRewritePattern<MyOp>(ctx, /*benefit=*/10) {}  // Default is 1
+   };
+   ```
+
+### Issue 4: Segmentation Faults
+
+**Common causes:**
+
+1. **Accessing erased operations:**
+   ```cpp
+   // BAD: Using op after replacement
+   rewriter.replaceOp(op, newValue);
+   llvm::errs() << *op;  // CRASH: op is erased
+   
+   // GOOD: Print before replacement
+   llvm::errs() << *op;
+   rewriter.replaceOp(op, newValue);
+   ```
+
+2. **Invalid operand indices:**
+   ```cpp
+   // From GenericFusionPass.cpp:62-64
+   if (prodMaps.size() <= producer.getNumDpsInputs() + prodResultIdx)
+     return failure();  // Bounds check prevents crash
+   ```
+
+3. **Null pointers:**
+   ```cpp
+   Value input = op.getOperand(0);
+   Operation *producer = input.getDefiningOp();
+   if (!producer) return failure();  // Could be block argument
+   ```
+
+### Issue 5: Type Mismatches After Bufferization
+
+**Symptom:** Pass works on tensors but fails on memrefs.
+
+**Example from ToyVectorizationPass.cpp:76-82:**
+
+```cpp
+static bool hasStaticShape(Type t) {
+  if (auto mr = dyn_cast<MemRefType>(t))
+    return mr.hasStaticShape();
+  if (auto rt = dyn_cast<RankedTensorType>(t))
+    return rt.hasStaticShape();
+  return false;
+}
+```
+
+**Debug:** Print type information:
+```cpp
+llvm::errs() << "Type: " << operand.getType() << "\n";
+if (auto memref = dyn_cast<MemRefType>(operand.getType())) {
+  llvm::errs() << "  Rank: " << memref.getRank() << "\n";
+  llvm::errs() << "  Shape: ";
+  for (int64_t dim : memref.getShape())
+    llvm::errs() << dim << " ";
+  llvm::errs() << "\n";
+}
+```
+
+## Debugging Specific Pass Types
+
+### Debugging Tiling Passes
+
+From `TilingPass.cpp:37-65`:
+
+```cpp
+LogicalResult matchAndRewrite(...) const override {
+  llvm::errs() << "DEBUG: Analyzing a DotGeneralOp...\n";
+  
+  // Dimension validation
+  int64_t M = lhsTy.getShape()[0];
+  int64_t K = lhsTy.getShape()[1];
+  int64_t N = rhsTy.getShape()[1];
+  
+  if (M % tileSizeM != 0 || N % tileSizeN != 0 || K % tileSizeK != 0) {
+    llvm::errs() << "DEBUG: Failed - Dimensions not divisible by tile size (4).\n";
+    return rewriter.notifyMatchFailure(op, "Dimensions not divisible");
+  }
+  
+  llvm::errs() << "DEBUG: MATCH SUCCESS! Rewriting into loops...\n";
+  // ... tiling logic ...
+}
+```
+
+**Key checks:**
+- Tile size divisibility
+- Loop bound calculations
+- Slice offset/size/stride correctness
+
+### Debugging Fusion Passes
+
+From `GenericFusionPass.cpp:27-32`:
+
+```cpp
+static bool hasReductionIterator(LinalgOp op) {
+  for (auto iter : op.getIteratorTypesArray()) {
+    if (linalg::isReductionIterator(iter)) return true;
+  }
+  return false;
+}
+```
+
+**Debug fusion legality:**
+
+```cpp
+if (hasReductionIterator(producer)) {
+  llvm::errs() << "Cannot fuse: producer has reduction\n";
+  return failure();
+}
+
+// Check indexing map compatibility
+if (producerResultMap != consumerInputMap) {
+  llvm::errs() << "Cannot fuse: map mismatch\n";
+  llvm::errs() << "  Producer: " << producerResultMap << "\n";
+  llvm::errs() << "  Consumer: " << consumerInputMap << "\n";
+  return failure();
+}
+```
+
+### Debugging Vectorization Passes
+
+From `ToyVectorizationPass.cpp:686-694`:
+
+```cpp
+FailureOr<int64_t> vecDimOr = chooseVectorDim(linalgOp, opt);
+if (failed(vecDimOr)) {
+  logDecision(opt.verbose, linalgOp.getOperation(),
+              "reject: no contiguous vector dim");
+  return failure();
+}
+int64_t vecDim = *vecDimOr;
+
+logDecision(opt.verbose, linalgOp.getOperation(),
+            "accept: vectorizing dim " + std::to_string(vecDim));
+```
+
+**Vectorization debugging flags:**
+```bash
+stablehlo-opt \
+  -toy-vectorize="verbose dump-first-bad-transfer" \
+  input.mlir
+```
+
+## Pipeline Debugging Workflow
+
+### Step 1: Bisect the Pipeline
+
+From `tools/run_attn_cache_pipeline.sh`, isolate the failing pass:
+
+```bash
+# Run stages incrementally
+OPT_BIN="third_party/stablehlo/build/bin/stablehlo-opt"
+
+# Stage 0
+"${OPT_BIN}" -stablehlo-tiling input.mlir -o stage0.mlir
+echo "Stage 0: OK"
+
+# Stage 1
+"${OPT_BIN}" -generic-fusion stage0.mlir -o stage1.mlir
+echo "Stage 1: OK"
+
+# Stage 2 (fails here)
+"${OPT_BIN}" \
+  "-stablehlo-linalg-tiling=l2-tile-sizes=64,64,64" \
+  stage1.mlir -o stage2.mlir
+echo "Stage 2: FAILED"
+```
+
+### Step 2: Minimize the Test Case
+
+Extract the failing function:
+
+```bash
+# Use mlir-opt to extract one function
+mlir-opt --pass-pipeline='builtin.module(func.func(print-op-stats))' stage1.mlir
+
+# Manually edit to smallest reproducer
+```
+
+### Step 3: Add Assertions
+
+From `GenericFusionPass.cpp:145-152`:
+
+```cpp
+unsigned prodNumInputs = producer.getNumDpsInputs();
+for (unsigned i = 0; i < producer.getNumDpsInits(); ++i) {
+  BlockArgument outArg = prodBlock.getArgument(prodNumInputs + i);
+  if (!outArg.use_empty()) {
+    // If the body uses the output accumulator, abort fusion to prevent crash.
+    return failure();
+  }
+}
+```
+
+### Step 4: Validate Intermediate IR
+
+```bash
+# Check IR is valid at each stage
+mlir-opt --verify-each stage0.mlir
+mlir-opt --verify-each stage1.mlir
+```
+
+## Advanced Debugging Techniques
+
+### 1. MLIR Pass Manager Options
+
+```bash
+stablehlo-opt \
+  -pass-timing \
+  -pass-statistics \
+  -mlir-print-ir-before-all \
+  -mlir-print-ir-after-all \
+  -mlir-print-ir-module-scope \
+  input.mlir
+```
+
+**Options:**
+- `-pass-timing`: Measure pass execution time
+- `-pass-statistics`: Show pattern application counts
+- `-mlir-print-ir-before-all`: Dump IR before each pass
+- `-mlir-print-ir-after-all`: Dump IR after each pass
+- `-mlir-disable-threading`: Single-threaded execution (easier debugging)
+
+### 2. FileCheck Tests
+
+Create regression tests:
+
+```mlir
+// RUN: stablehlo-opt %s -my-pass | FileCheck %s
+
+func.func @test(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  // CHECK-LABEL: func.func @test
+  // CHECK: linalg.matmul
+  // CHECK-NOT: stablehlo.dot_general
+  %0 = stablehlo.dot_general %arg0, %arg0, 
+    contracting_dims = [1] x [0] 
+    : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+  return %0 : tensor<4x4xf32>
+}
+```
+
+### 3. Custom Verification
+
+Add post-pass checks:
+
+```cpp
+void runOnOperation() override {
+  // ... apply patterns ...
+  
+  // Custom verification
+  getOperation().walk([&](Operation *op) {
+    if (isa<stablehlo::DotGeneralOp>(op)) {
+      llvm::errs() << "ERROR: DotGeneralOp should be eliminated\n";
+      signalPassFailure();
+    }
+  });
+}
+```
+
+## Performance Debugging
+
+### Profiling Pass Execution
+
+```bash
+# Time individual passes
+time stablehlo-opt -my-pass input.mlir -o /dev/null
+
+# Use pass timing
+stablehlo-opt -pass-timing input.mlir 2>&1 | grep "my-pass"
+```
+
+### Pattern Application Statistics
+
+From `GenericFusionPass.cpp:247-252`:
+
+```cpp
+GreedyRewriteConfig config;
+config.useTopDownTraversal = true;
+config.enableRegionSimplification = true;
+config.maxIterations = 10;  // Limit iterations
+
+if (failed(applyPatternsAndFoldGreedily(getOperation(), 
+                                        std::move(patterns), config))) {
+  // Pattern application failed
+}
+```
+
+Run with `-pass-statistics` to see pattern counts.
+
+## Tools and Scripts
+
+### mlir-opt
+
+Core MLIR optimizer:
+
+```bash
+# Verify IR
+mlir-opt --verify-each input.mlir
+
+# Print in generic form (explicit attributes)
+mlir-opt -mlir-print-op-generic input.mlir
+
+# Run specific pass
+mlir-opt -pass-pipeline='builtin.module(func.func(cse))' input.mlir
+```
+
+### stablehlo-opt
+
+StableHLO-specific optimizer (includes custom passes):
+
+```bash
+# List available passes
+stablehlo-opt --help | grep -A 2 "PASS OPTIONS"
+
+# Run with verbose
+stablehlo-opt -toy-vectorize="verbose" input.mlir
+```
+
+### mlir-cpu-runner
+
+Execute MLIR for correctness testing:
+
+```bash
+# From tools/benchmark_stage5.sh
+mlir-cpu-runner stage5.mlir \
+  -e main \
+  -entry-point-result=void \
+  -shared-libs=$(llvm-config --libdir)/libmlir_runner_utils.so
+```
+
+## Debugging Checklist Summary
+
+- [ ] Run passes incrementally, dump IR at each stage
+- [ ] Enable `-verbose` flags on custom passes
+- [ ] Use `LLVM_DEBUG()` macros with `-debug-only=pass-name`
+- [ ] Check verifier errors carefully
+- [ ] Add recursion guards to prevent infinite loops
+- [ ] Validate operand/result indices before access
+- [ ] Print operations before erasing/replacing
+- [ ] Use assertions for invariants
+- [ ] Test with `-mlir-disable-threading` for determinism
+- [ ] Create minimal reproducers
+- [ ] Write FileCheck regression tests
+
+## Next Steps
+
+- **[Creating Custom Passes](./custom-passes)** - Pass development guide
+- **[Contributing](./contributing)** - Submit fixes and improvements
+- **[MLIR Debugging Docs](https://mlir.llvm.org/docs/Diagnostics/)** - Upstream MLIR diagnostics guide

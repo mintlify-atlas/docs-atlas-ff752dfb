@@ -1,0 +1,104 @@
+---
+title: "Welcome to microMLC"
+description: "A playground for exploring MLIR/StableHLO compiler passes on transformer workloads"
+---
+
+# microMLC: Micro Machine Learning Compiler
+
+microMLC is a playground for exploring MLIR and StableHLO compiler passes specifically designed for transformer workloads. It provides a complete pipeline from high-level StableHLO operations to optimized, vectorized MLIR code with focus on tiling, fusion, bufferization, and vectorization optimizations.
+
+<CardGroup cols={2}>
+  <Card
+    title="Quickstart"
+    icon="rocket"
+    href="/quickstart"
+  >
+    Get up and running with microMLC in minutes
+  </Card>
+  <Card
+    title="Architecture Overview"
+    icon="sitemap"
+    href="/architecture/overview"
+  >
+    Learn about the compiler pipeline and IR stages
+  </Card>
+  <Card
+    title="Compiler Passes"
+    icon="gears"
+    href="/passes/overview"
+  >
+    Explore custom MLIR optimization passes
+  </Card>
+  <Card
+    title="Benchmarking"
+    icon="chart-line"
+    href="/usage/benchmarking"
+  >
+    Measure and compare optimization performance
+  </Card>
+</CardGroup>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Multi-Level Tiling" icon="table-cells">
+    L2 and L1 cache-aware tiling for optimal memory access patterns
+  </Card>
+  <Card title="Operation Fusion" icon="link">
+    Fuse adjacent Linalg generic operations to reduce memory traffic
+  </Card>
+  <Card title="Bufferization" icon="database">
+    One-shot tensor-to-memref conversion with efficient memory management
+  </Card>
+  <Card title="Vectorization" icon="microchip">
+    SIMD vectorization with configurable vector width for target hardware
+  </Card>
+</CardGroup>
+
+## Pipeline Stages
+
+The microMLC compiler pipeline transforms StableHLO operations through multiple optimization stages:
+
+<Steps>
+  <Step title="StableHLO to Linalg">
+    Convert high-level StableHLO operations into Linalg generic operations with initial tiling
+  </Step>
+  <Step title="Generic Fusion">
+    Fuse producer-consumer chains of Linalg operations to reduce intermediate buffers
+  </Step>
+  <Step title="Multi-Level Tiling">
+    Apply cache-aware tiling at L2 and L1 levels for optimal memory hierarchy utilization
+  </Step>
+  <Step title="Bufferization">
+    Transform tensor operations into memref operations with explicit memory management
+  </Step>
+  <Step title="Vectorization">
+    Generate SIMD vector instructions for parallel computation on modern CPUs
+  </Step>
+</Steps>
+
+## Toolchain
+
+microMLC builds on top of industry-standard compiler infrastructure:
+
+- **MLIR/LLVM 18.1.8**: Core compiler infrastructure and optimization framework
+- **StableHLO v0.13.0**: Stable high-level operations for machine learning
+- **Linalg Dialect**: Structured linear algebra operations on tensors and buffers
+- **mlir-cpu-runner**: Runtime execution and benchmarking of optimized IR
+
+<CardGroup cols={2}>
+  <Card
+    title="Setup Guide"
+    icon="wrench"
+    href="/setup/installation"
+  >
+    Install dependencies and build the toolchain
+  </Card>
+  <Card
+    title="Custom Passes"
+    icon="code"
+    href="/development/custom-passes"
+  >
+    Learn how to develop your own compiler passes
+  </Card>
+</CardGroup>

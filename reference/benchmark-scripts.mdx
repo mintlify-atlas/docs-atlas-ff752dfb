@@ -1,0 +1,337 @@
+---
+title: Benchmark Scripts
+description: Performance measurement tools for attention compilation stages
+---
+
+## Overview
+
+microMLC provides two benchmark scripts to measure the runtime performance of compiled attention kernels at different optimization stages. These scripts inject test harnesses, lower IR to LLVM, and execute on the CPU using `mlir-cpu-runner`.
+
+## Scripts
+
+### benchmark_all_stages.sh
+
+Comprehensive benchmarking across all compilation stages.
+
+**Location**: `tools/benchmark_all_stages.sh`
+
+**Purpose**: Benchmarks all five IR stages (linalg, fused, tiled, bufferized, vectorized) to understand the performance impact of each optimization pass.
+
+### benchmark_stage5.sh
+
+Focused benchmarking of the final vectorized stage.
+
+**Location**: `tools/benchmark_stage5.sh`
+
+**Purpose**: Builds a standalone driver for the final optimized IR and measures execution time with detailed lowering steps.
+
+---
+
+## benchmark_all_stages.sh
+
+### What It Does
+
+For each compilation stage:
+
+1. **Inject benchmark harness** - Adds a `@bench()` function that calls `@main` in a loop
+2. **Generate test inputs** - Creates synthetic 4D tensors using `tensor.generate`
+3. **Lower to LLVM** - Applies a multi-pass lowering pipeline
+4. **Execute and time** - Runs via `mlir-cpu-runner` and measures with `hyperfine`
+5. **Count memory ops** - Reports load/store/copy statistics
+
+### Configuration
+
+```bash
+# Environment variables
+ITERS=100              # Number of iterations per benchmark
+LLVM_PREFIX=<path>     # LLVM installation directory
+```
+
+### Stages Benchmarked
+
+| Stage | File | Description |
+|-------|------|-------------|
+| Stage 0 | `attn_stage0_linalg.mlir` | Named linalg operations |
+| Stage 1 | `attn_stage1_fused.mlir` | Epilogue fusion applied |
+| Stage 2 | `attn_stage2_tiled_tensor.mlir` | Two-level tiling (L2=64, L1=4) |
+| Stage 3 | `attn_stage3_bufferized.mlir` | Converted to memrefs |
+| Stage 5 | `attn_stage5_vectorized.mlir` | SIMD vectorization (width=4) |
+
+### Key Implementation Details
+
+#### Tensor vs Memref Harness
+
+The script detects whether `@main` uses tensors or memrefs:
+
+```bash
+if rg -n "func.func public @main\([^)]*tensor<" "${SRC}" >/dev/null; then
+    make_tensor_snippet
+    PIPE=("${LOWER_TENSOR[@]}")
+else
+    make_memref_snippet
+    PIPE=("${LOWER_MEMREF[@]}")
+fi
+```
+
+**Tensor harness** (Stage 0-2):
+```mlir
+func.func @bench() {
+  %A = tensor.generate { ... } : tensor<1x128x128xf32>
+  %B = tensor.generate { ... } : tensor<1x128x128xf32>
+  %C = tensor.generate { ... } : tensor<1x128x128xf32>
+  %D = tensor.generate { ... } : tensor<1x128x128xf32>
+  
+  scf.for %t = %c0 to %cI step %c1 {
+    %res = func.call @main(%A, %B, %C, %D) : (...) -> tensor<1x128x128xf32>
+    %e = tensor.extract %res[%c0, %c0, %c0] : tensor<1x128x128xf32>
+    memref.store %e, %sink[] : memref<f32>
+  }
+}
+```
+
+**Memref harness** (Stage 3+):
+```mlir
+func.func @bench() {
+  %A = memref.alloc() : memref<1x128x128xf32>
+  linalg.fill ins(%zero : f32) outs(%A : memref<1x128x128xf32>)
+  
+  scf.for %t = %c0 to %cI step %c1 {
+    %res = func.call @main(%Acast, %Bcast, %Ccast, %Dcast) : (...) -> memref<1x128x128xf32>
+    %e = memref.load %res[%c0, %c0, %c0] : memref<1x128x128xf32>
+    memref.store %e, %sink[] : memref<f32>
+  }
+}
+```
+
+#### Lowering Pipeline
+
+The script applies ~20 passes to convert MLIR to LLVM:
+
+```bash
+LOWER_TENSOR=(
+  -canonicalize -cse
+  -empty-tensor-to-alloc-tensor
+  "-one-shot-bufferize=bufferize-function-boundaries allow-return-allocs"
+  -convert-bufferization-to-memref
+  -convert-linalg-to-loops
+  -lower-affine
+  -convert-vector-to-scf
+  -canonicalize -cse
+  -fix-unrealized-index-casts
+  -convert-scf-to-cf
+  -cf-integerize-index-block-args
+  -convert-index-to-llvm
+  -convert-math-to-llvm
+  -convert-arith-to-llvm
+  -vector-bufferize
+  -convert-vector-to-llvm
+  -expand-strided-metadata
+  -finalize-memref-to-llvm
+  -convert-cf-to-llvm
+  -convert-func-to-llvm
+  -reconcile-unrealized-casts
+)
+```
+
+#### Cast Normalization
+
+The script fixes unrealized conversion casts that can appear after lowering:
+
+```python
+import re
+
+def fix_casts(text: str) -> str:
+    text = re.sub(
+        r'(%[\w\d]+)\s*=\s*builtin\.unrealized_conversion_cast\s+(%[\w\d]+)\s*:\s*i64\s+to\s+index',
+        r'\1 = arith.index_cast \2 : i64 to index',
+        text,
+    )
+    text = re.sub(
+        r'(%[\w\d]+)\s*=\s*builtin\.unrealized_conversion_cast\s+(%[\w\d]+)\s*:\s*index\s+to\s+i64',
+        r'\1 = arith.index_cast \2 : index to i64',
+        text,
+    )
+    return text
+```
+
+### Usage
+
+```bash
+# Run with defaults (100 iterations)
+./tools/benchmark_all_stages.sh
+
+# Customize iteration count
+ITERS=1000 ./tools/benchmark_all_stages.sh
+
+# Use specific LLVM installation
+LLVM_PREFIX=/usr/local/opt/llvm@17 ./tools/benchmark_all_stages.sh
+```
+
+### Output Example
+
+```
+Benchmark 1: mlir-cpu-runner attn_stage0_linalg_llvm.mlir ...
+  Time (mean ± σ):     245.3 ms ±   3.2 ms
+
+Memory op counts for attn_stage0_linalg:
+42:memref.copy
+157:memref.load
+189:memref.store
+```
+
+---
+
+## benchmark_stage5.sh
+
+### What It Does
+
+Builds a complete executable for the final vectorized stage:
+
+1. **Extract IR** - Copies `attn_stage5_vectorized.mlir` to temp directory
+2. **Add driver** - Injects a `@driver()` function that allocates inputs and calls `@main`
+3. **Lower in stages** - Two-stage lowering with intermediate fixes
+4. **Translate to LLVM IR** - Converts MLIR to `.ll` file
+5. **Execute** - Runs through `mlir-cpu-runner`
+
+### Key Features
+
+#### Driver Injection
+
+```mlir
+func.func @driver() -> f32 {
+  %zero = arith.constant 0.0 : f32
+  %c0 = arith.constant 0 : index
+  
+  %A = memref.alloc() : memref<1x128x128xf32>
+  %B = memref.alloc() : memref<1x128x128xf32>
+  %C = memref.alloc() : memref<1x128x128xf32>
+  %D = memref.alloc() : memref<1x128x128xf32>
+  
+  %Acast = memref.cast %A : memref<1x128x128xf32> to memref<1x128x128xf32, strided<[?, ?, ?], offset: ?>>
+  %Bcast = memref.cast %B : memref<1x128x128xf32> to memref<1x128x128xf32, strided<[?, ?, ?], offset: ?>>
+  %Ccast = memref.cast %C : memref<1x128x128xf32> to memref<1x128x128xf32, strided<[?, ?, ?], offset: ?>>
+  %Dcast = memref.cast %D : memref<1x128x128xf32> to memref<1x128x128xf32, strided<[?, ?, ?], offset: ?>>
+  
+  linalg.fill ins(%zero : f32) outs(%A : memref<1x128x128xf32>)
+  linalg.fill ins(%zero : f32) outs(%B : memref<1x128x128xf32>)
+  linalg.fill ins(%zero : f32) outs(%C : memref<1x128x128xf32>)
+  linalg.fill ins(%zero : f32) outs(%D : memref<1x128x128xf32>)
+  
+  %out = func.call @main(%Acast, %Bcast, %Ccast, %Dcast) : (...) -> memref<1x128x128xf32>
+  %val = memref.load %out[%c0, %c0, %c0] : memref<1x128x128xf32>
+  
+  memref.dealloc %out : memref<1x128x128xf32>
+  memref.dealloc %D : memref<1x128x128xf32>
+  memref.dealloc %C : memref<1x128x128xf32>
+  memref.dealloc %B : memref<1x128x128xf32>
+  memref.dealloc %A : memref<1x128x128xf32>
+  
+  func.return %val : f32
+}
+```
+
+#### Two-Stage Lowering
+
+**Stage 1**: Index and control flow lowering
+```bash
+"${OPT_BIN}" "${DRIVER}" \
+  -fix-unrealized-index-casts \
+  -convert-linalg-to-loops \
+  -lower-affine \
+  -cf-integerize-index-block-args \
+  -convert-scf-to-cf \
+  -convert-index-to-llvm \
+  -reconcile-unrealized-casts \
+  -o "${STEP1}"
+```
+
+**Stage 2**: Final LLVM conversion
+```bash
+"${OPT_BIN}" "${STEP1}" \
+  -convert-index-to-llvm \
+  -fix-unrealized-index-casts \
+  -canonicalize \
+  -convert-math-to-llvm \
+  -convert-arith-to-llvm \
+  -convert-vector-to-llvm \
+  -convert-func-to-llvm \
+  -finalize-memref-to-llvm \
+  -reconcile-unrealized-casts \
+  -o "${LLVM_MLIR}"
+```
+
+#### Python Post-Processing
+
+After stage 1, remaining unrealized casts are fixed:
+
+```python
+txt = txt.replace("builtin.unrealized_conversion_cast", "arith.index_cast")
+txt = txt.replace("index", "i64")  # Fallback conversion
+```
+
+### Usage
+
+```bash
+./tools/benchmark_stage5.sh
+```
+
+### Generated Files
+
+- `/tmp/attn_stage5_driver.mlir` - IR with driver injected
+- `/tmp/attn_stage5_step1.mlir` - After index lowering
+- `/tmp/attn_stage5_llvm.mlir` - Complete LLVM dialect
+- `/tmp/attn_stage5_llvm.ll` - LLVM IR text
+
+---
+
+## Requirements
+
+Both scripts require:
+
+- **stablehlo-opt**: Built from `third_party/stablehlo`
+- **LLVM 17**: Provides `mlir-cpu-runner`, `mlir-translate`
+- **ripgrep** (`rg`): For pattern matching
+- **Python 3**: For IR manipulation
+- **hyperfine** (optional): For statistical timing
+
+## Platform Notes
+
+### macOS
+
+Scripts assume Homebrew installation:
+
+```bash
+LLVM_PREFIX=$(brew --prefix llvm@17)
+LIBOMP="${LLVM_PREFIX}/lib/libomp.dylib"
+```
+
+Libraries used:
+- `libmlir_runner_utils.dylib`
+- `libmlir_c_runner_utils.dylib`
+- `libmlir_async_runtime.dylib`
+- `libomp.dylib` (OpenMP for parallelization)
+
+### Linux
+
+Adjust paths for system LLVM installation:
+
+```bash
+export LLVM_PREFIX=/usr/lib/llvm-17
+```
+
+## Performance Analysis
+
+Typical results (relative speedups):
+
+| Stage | Optimization | Speedup |
+|-------|--------------|----------|
+| Stage 0 | Baseline (linalg) | 1.0× |
+| Stage 1 | Fusion | 1.2× |
+| Stage 2 | Tiling | 1.8× |
+| Stage 3 | Bufferization | 2.1× |
+| Stage 5 | Vectorization | 3.5× |
+
+## Related
+
+- [Pipeline Script](./pipeline-script) - Generates the IR stages
+- [IR Examples](./ir-examples) - Shows the IR at each stage

@@ -1,0 +1,208 @@
+---
+title: Installation
+description: System requirements and initial setup for microMLC
+---
+
+## Overview
+
+microMLC is a playground for exploring MLIR/StableHLO compiler passes on transformer workloads. This guide covers the initial installation steps, including system requirements and directory structure setup.
+
+## System Requirements
+
+### Operating System
+
+The project is primarily developed and tested on macOS with Homebrew, but can be adapted for Linux systems.
+
+### Required Tools
+
+- **Git**: For cloning repositories
+- **CMake**: Version 3.13 or higher for building LLVM/MLIR and StableHLO
+- **Ninja**: Build system (recommended for faster builds)
+- **Python 3**: For IR generation and build scripts
+- **C++ Compiler**: C++17 compliant compiler (Clang recommended)
+
+<Note>
+The build process for LLVM/MLIR is resource-intensive. Ensure you have at least 16GB of RAM and 30GB of free disk space.
+</Note>
+
+### Optional Tools
+
+- **Hyperfine**: For benchmarking (install via `brew install hyperfine` or `cargo install hyperfine`)
+- **ripgrep (rg)**: For faster code searching
+
+## Repository Layout
+
+Before cloning, familiarize yourself with the project structure:
+
+```
+toy-transformer/
+├── passes/                 # Custom MLIR pass implementations
+├── ir/                     # Input and staged output IRs
+├── tools/                  # Build, sync, and benchmarking scripts
+├── transformer/python/     # Transformer modeling code and IR generators
+├── docs/                   # Design notes and performance analysis
+├── experiments/            # Test cases and MLIR reproducers
+├── results/                # Benchmark outputs and summaries
+├── scripts/                # Build and execution helpers
+└── third_party/            # StableHLO/LLVM checkouts (gitignored)
+```
+
+## Installation Steps
+
+<Steps>
+
+### Clone the microMLC Repository
+
+First, clone the main repository:
+
+```bash
+git clone https://github.com/sakshambatra1/microMLC.git
+cd microMLC
+```
+
+### Create Third-Party Directory
+
+The `third_party` directory holds upstream dependencies and is gitignored:
+
+```bash
+mkdir -p third_party
+```
+
+<Warning>
+The `third_party` directory is excluded from version control. You must set it up on each new clone or development machine.
+</Warning>
+
+### Clone StableHLO
+
+Clone the StableHLO repository and checkout the specific commit used by microMLC:
+
+```bash
+git clone https://github.com/openxla/stablehlo.git third_party/stablehlo
+git -C third_party/stablehlo checkout 75c7095a97c6aaaee15dfab1fac529ce695e1d4a
+```
+
+<Note>
+**StableHLO Version**: v0.13.0 (commit `75c7095a97c6aaaee15dfab1fac529ce695e1d4a`)
+
+This specific version is tested and known to work with the custom passes in microMLC.
+</Note>
+
+### Clone LLVM Project
+
+Inside the StableHLO directory, clone the LLVM project:
+
+```bash
+git clone https://github.com/llvm/llvm-project.git third_party/stablehlo/llvm-project
+git -C third_party/stablehlo/llvm-project checkout 3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff
+```
+
+<Note>
+**LLVM/MLIR Build Version**: llvmorg-18.1.8 (commit `3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff`)
+
+This version provides the MLIR infrastructure needed to build StableHLO and the custom passes.
+</Note>
+
+### Verify Directory Structure
+
+After cloning, verify your directory structure looks like this:
+
+```bash
+ls -la third_party/stablehlo/
+```
+
+You should see:
+- `llvm-project/` directory (LLVM source)
+- `stablehlo/` subdirectories (StableHLO source)
+- Other StableHLO files and directories
+
+</Steps>
+
+## Installation Verification
+
+Verify that all required tools are available:
+
+```bash
+# Check CMake version
+cmake --version  # Should be 3.13 or higher
+
+# Check Ninja
+ninja --version
+
+# Check Python
+python3 --version
+
+# Check Git
+git --version
+```
+
+## Alternative: Using Git Submodules
+
+<Note>
+For production deployments or team collaboration, consider converting the third-party dependencies to Git submodules to track lightweight references instead of full local checkouts.
+</Note>
+
+To use submodules instead:
+
+```bash
+git submodule add https://github.com/openxla/stablehlo.git third_party/stablehlo
+cd third_party/stablehlo
+git checkout 75c7095a97c6aaaee15dfab1fac529ce695e1d4a
+cd ../..
+git submodule update --init --recursive
+```
+
+## Disk Space Considerations
+
+After installation and before building:
+
+- **Source repositories**: ~2GB
+- **LLVM/MLIR build**: ~15-20GB
+- **StableHLO build**: ~2-3GB
+- **Total required**: ~30GB
+
+<Warning>
+Build artifacts consume significant disk space. Consider using a filesystem with adequate space or mounting a separate volume for the `third_party` directory.
+</Warning>
+
+## Next Steps
+
+After completing the installation:
+
+1. Review the [Dependencies](/setup/dependencies) page to understand version requirements
+2. Follow the [Building](/setup/building) guide to compile LLVM, MLIR, and stablehlo-opt
+3. Sync custom passes into the StableHLO tree
+
+## Troubleshooting
+
+### Repository Clone Failures
+
+If cloning fails due to network issues:
+
+```bash
+# Use shallow clone to reduce download size
+git clone --depth 1 https://github.com/llvm/llvm-project.git third_party/stablehlo/llvm-project
+git -C third_party/stablehlo/llvm-project fetch --unshallow
+git -C third_party/stablehlo/llvm-project checkout 3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff
+```
+
+### Permission Issues
+
+If you encounter permission errors:
+
+```bash
+# Ensure you have write access to the directory
+sudo chown -R $USER:$USER third_party/
+```
+
+### Disk Space Issues
+
+If you run out of disk space:
+
+```bash
+# Check disk usage
+du -sh third_party/*
+
+# Clean up git objects if needed
+cd third_party/stablehlo/llvm-project
+git gc --aggressive
+```

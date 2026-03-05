@@ -1,0 +1,671 @@
+---
+title: Contributing to microMLC
+description: Guidelines for contributing code, passes, and documentation to the microMLC project
+---
+
+## Overview
+
+microMLC is an open-source MLIR compiler playground focused on transformer optimizations. Contributions are welcome in the form of new passes, bug fixes, performance improvements, and documentation.
+
+## Repository Structure
+
+```
+microMLC/
+├── passes/                 # Custom MLIR pass implementations
+│   ├── Passes.td          # TableGen pass declarations
+│   ├── Passes.h           # Pass factory functions
+│   ├── CMakeLists.txt     # Build configuration
+│   └── *.cpp              # Pass implementations
+├── tools/                  # Build and automation scripts
+│   ├── sync_passes.sh     # Deploy passes to StableHLO
+│   ├── run_*.sh           # Pipeline execution scripts
+│   └── benchmark_*.sh     # Performance benchmarks
+├── ir/                     # Input and staged MLIR files
+├── transformer/            # Python modeling and IR generation
+├── docs/                   # Design notes and analysis
+├── experiments/            # Test cases and reproducers
+├── results/                # Benchmark outputs
+└── third_party/            # StableHLO/LLVM (gitignored)
+```
+
+## Getting Started
+
+### 1. Fork and Clone
+
+```bash
+git clone https://github.com/YOUR_USERNAME/microMLC.git
+cd microMLC
+```
+
+### 2. Set Up Development Environment
+
+Follow the setup instructions from the main README:
+
+```bash
+# Clone dependencies
+mkdir -p third_party
+git clone https://github.com/openxla/stablehlo.git third_party/stablehlo
+git -C third_party/stablehlo checkout 75c7095a97c6aaaee15dfab1fac529ce695e1d4a
+
+git clone https://github.com/llvm/llvm-project.git third_party/stablehlo/llvm-project
+git -C third_party/stablehlo/llvm-project checkout 3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff
+
+# Build LLVM/MLIR (takes ~1 hour)
+cmake -S third_party/stablehlo/llvm-project/llvm \
+  -B third_party/stablehlo/llvm-project/build \
+  -G Ninja \
+  -DLLVM_ENABLE_PROJECTS=mlir \
+  -DLLVM_TARGETS_TO_BUILD=host \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build third_party/stablehlo/llvm-project/build
+
+# Build stablehlo-opt
+bash tools/sync_passes.sh  # Sync custom passes first
+cmake -S third_party/stablehlo \
+  -B third_party/stablehlo/build \
+  -G Ninja \
+  -DMLIR_DIR=third_party/stablehlo/llvm-project/build/lib/cmake/mlir \
+  -DLLVM_DIR=third_party/stablehlo/llvm-project/build/lib/cmake/llvm \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build third_party/stablehlo/build -t stablehlo-opt
+```
+
+### 3. Verify Installation
+
+```bash
+# Test the optimizer
+third_party/stablehlo/build/bin/stablehlo-opt --help | grep "generic-fusion"
+
+# Run a test pipeline
+bash tools/run_attn_cache_pipeline.sh
+```
+
+## Code Style and Standards
+
+### C++ Style
+
+microMLC follows the [LLVM Coding Standards](https://llvm.org/docs/CodingStandards.html):
+
+#### Naming Conventions
+
+```cpp
+// Types: UpperCamelCase
+struct MyCustomPass { };
+class FusionPattern { };
+
+// Functions/Methods: lowerCamelCase
+void runOnOperation();
+LogicalResult matchAndRewrite(...);
+
+// Variables: lowerCamelCase
+Value input = op.getOperand(0);
+int64_t tileSize = 4;
+
+// Constants: lowerCamelCase
+constexpr int64_t tileSizeM = 4;  // From TilingPass.cpp:23
+
+// Members: lowerCamelCase (no prefix)
+Option<bool> verbose;
+VectorizationOptions opt;
+```
+
+#### Formatting
+
+```cpp
+// Indentation: 2 spaces (no tabs)
+if (condition) {
+  doSomething();
+}
+
+// Line length: 80 characters (soft limit)
+// Break long function calls:
+auto result = rewriter.create<linalg::GenericOp>(
+    consumer.getLoc(), 
+    consumer->getResultTypes(),
+    fusedInputs, 
+    fusedOutputs, 
+    fusedMaps,
+    fusedIterators);
+
+// Braces: always use for control flow
+if (hasReductionIterator(producer))
+  continue;  // BAD
+
+if (hasReductionIterator(producer)) {
+  continue;  // GOOD
+}
+```
+
+#### Comments
+
+From `GenericFusionPass.cpp:24-36`:
+
+```cpp
+// ============================================================================
+// Helper: Check for Reduction Iterators
+// ============================================================================
+static bool hasReductionIterator(LinalgOp op) {
+  for (auto iter : op.getIteratorTypesArray()) {
+    if (linalg::isReductionIterator(iter)) return true;
+  }
+  return false;
+}
+
+// ============================================================================
+// Core Fusion Logic
+// ============================================================================
+static LogicalResult fuseProducerEpilogue(...) {
+  // 1. Basic Validation
+  if (producer->getNumRegions() == 0) return failure();
+  
+  // 2. Identify Producer Result
+  OpResult producerResult = dyn_cast<OpResult>(fusedOperand.get());
+```
+
+**Guidelines:**
+- Use section headers (`// ===...===`) for major sections
+- Number steps in complex algorithms
+- Explain "why" not "what" (code shows what)
+- Add `CRITICAL FIX` or `FIXME` for important notes
+
+### Pass Implementation Style
+
+#### Structure
+
+Organize passes consistently:
+
+```cpp
+// 1. Includes
+#include "stablehlo/transforms/Passes.h"
+#include <mlir/...>
+
+using namespace mlir;
+
+// 2. Anonymous namespace for internal helpers
+namespace {
+
+// 3. Helper functions
+static bool isLegal(...) { }
+
+// 4. Pattern classes
+struct MyPattern : public OpRewritePattern<MyOp> {
+  LogicalResult matchAndRewrite(...) const override;
+};
+
+// 5. Pass class
+struct MyPass : public PassWrapper<MyPass, OperationPass<func::FuncOp>> {
+  void runOnOperation() override;
+};
+
+}  // namespace
+
+// 6. Public API in mlir::stablehlo namespace
+namespace mlir {
+namespace stablehlo {
+
+std::unique_ptr<Pass> createMyPass() {
+  return std::make_unique<MyPass>();
+}
+
+void registerMyPass() {
+  PassRegistration<MyPass>();
+}
+
+}  // namespace stablehlo
+}  // namespace mlir
+```
+
+#### Error Handling
+
+From `GenericFusionPass.cpp:42-54`:
+
+```cpp
+// Return failure early for invalid cases
+if (producer->getNumRegions() == 0 || producer->getRegion(0).empty()) {
+  return failure();
+}
+
+OpResult producerResult = dyn_cast<OpResult>(fusedOperand.get());
+if (!producerResult || producerResult.getOwner() != producer.getOperation()) {
+  return failure();
+}
+
+// Validate array bounds BEFORE accessing
+if (prodMaps.size() <= producer.getNumDpsInputs() + prodResultIdx)
+  return failure();
+if (consMaps.size() <= consumerInputIdx)
+  return failure();
+```
+
+**Best practices:**
+- Check preconditions early, return `failure()` immediately
+- Validate array indices before access
+- Use `assert()` for internal invariants (debug builds only)
+- Never crash on invalid user input
+
+## Contributing a New Pass
+
+### Step 1: Design Document
+
+Before coding, create a design doc in `docs/design/`:
+
+```markdown
+# My New Pass
+
+## Motivation
+Why is this pass needed? What problem does it solve?
+
+## Algorithm
+High-level description of the transformation.
+
+## Example
+Input IR → Output IR
+
+## Testing Plan
+How will you validate correctness and performance?
+```
+
+### Step 2: Implementation
+
+Follow the [Creating Custom Passes](./custom-passes) guide:
+
+1. Add TableGen definition to `passes/Passes.td`
+2. Declare factory/registration in `passes/Passes.h`
+3. Implement in `passes/MyPass.cpp`
+4. Update `passes/CMakeLists.txt`
+5. Add to `tools/sync_passes.sh`
+
+### Step 3: Testing
+
+#### Unit Tests
+
+Create test files in `experiments/`:
+
+```mlir
+// experiments/test_my_pass.mlir
+// RUN: stablehlo-opt %s -my-pass | FileCheck %s
+
+func.func @simple_case(%arg0: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  // CHECK-LABEL: func.func @simple_case
+  // CHECK: optimized.op
+  // CHECK-NOT: unoptimized.op
+  %0 = unoptimized.op %arg0 : tensor<4x4xf32>
+  return %0 : tensor<4x4xf32>
+}
+```
+
+#### Integration Tests
+
+Add to pipeline scripts:
+
+```bash
+# tools/test_my_pass.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+OPT_BIN="third_party/stablehlo/build/bin/stablehlo-opt"
+
+"${OPT_BIN}" \
+  experiments/test_my_pass.mlir \
+  -my-pass \
+  -o /tmp/output.mlir
+
+echo "Test passed!"
+```
+
+#### Benchmarks
+
+Measure performance impact:
+
+```bash
+# Before optimization
+time bash tools/benchmark_stage5.sh > /tmp/before.txt
+
+# After adding your pass
+time bash tools/benchmark_stage5.sh > /tmp/after.txt
+
+# Compare results
+diff /tmp/before.txt /tmp/after.txt
+```
+
+### Step 4: Documentation
+
+Update documentation:
+
+1. **README.md**: Add pass to the table
+   ```markdown
+   | Pass | Description |
+   |------|-------------|
+   | [MyPass.cpp](passes/MyPass.cpp) | Brief description |
+   ```
+
+2. **docs/**: Add detailed design notes if complex
+
+3. **Code comments**: Explain non-obvious logic
+
+### Step 5: Submit Pull Request
+
+```bash
+# Create feature branch
+git checkout -b feature/my-new-pass
+
+# Make changes
+git add passes/MyPass.cpp
+git add passes/Passes.td
+git add passes/Passes.h
+git add passes/CMakeLists.txt
+git add tools/sync_passes.sh
+
+# Commit with descriptive message
+git commit -m "Add MyPass for [brief description]
+
+- Implements [transformation] on [operation types]
+- Improves [metric] by [amount]
+- Includes unit tests and benchmarks
+
+Closes #123"
+
+# Push to fork
+git push origin feature/my-new-pass
+```
+
+## Pull Request Guidelines
+
+### PR Description Template
+
+```markdown
+## Summary
+Brief description of the change.
+
+## Motivation
+Why is this change needed? Link to issues if applicable.
+
+## Changes
+- Added `MyPass.cpp` implementing [transformation]
+- Updated build files and sync script
+- Added tests in `experiments/test_my_pass.mlir`
+
+## Testing
+- [ ] Unit tests pass
+- [ ] Integration tests pass
+- [ ] Benchmarks show [X%] improvement on [workload]
+- [ ] No regressions on existing tests
+
+## Performance Impact
+| Workload | Before | After | Improvement |
+|----------|--------|-------|-------------|
+| Attention | 100ms | 85ms | 15% |
+
+## Checklist
+- [ ] Code follows LLVM style
+- [ ] Added documentation
+- [ ] Passes `-mlir-verify-each`
+- [ ] No compiler warnings
+```
+
+### Review Process
+
+1. **Automated checks**: CI runs tests and linters
+2. **Code review**: Maintainers review design and implementation
+3. **Revisions**: Address feedback, update PR
+4. **Approval**: Requires 1+ maintainer approval
+5. **Merge**: Maintainer merges to main branch
+
+## Bug Reports
+
+### Issue Template
+
+```markdown
+**Describe the bug**
+Clear description of the problem.
+
+**To Reproduce**
+Steps to reproduce:
+1. Run `stablehlo-opt input.mlir -my-pass`
+2. Observe error: `...`
+
+**Expected behavior**
+What should happen instead.
+
+**MLIR Input**
+```mlir
+// Minimal reproducer
+func.func @repro(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+  // ...
+}
+```
+
+**Environment**
+- OS: macOS 14.1
+- LLVM version: 18.1.8
+- StableHLO commit: 75c7095
+
+**Additional context**
+Stack trace, error messages, etc.
+```
+
+## Development Workflow
+
+### Daily Development
+
+```bash
+# 1. Pull latest changes
+git pull origin main
+
+# 2. Create branch
+git checkout -b fix/issue-123
+
+# 3. Make changes to passes/
+vim passes/GenericFusionPass.cpp
+
+# 4. Sync and rebuild
+bash tools/sync_passes.sh
+cmake --build third_party/stablehlo/build -t stablehlo-opt
+
+# 5. Test changes
+third_party/stablehlo/build/bin/stablehlo-opt \
+  experiments/test.mlir \
+  -generic-fusion \
+  -o /tmp/out.mlir
+
+# 6. Run benchmarks
+bash tools/benchmark_all_stages.sh
+
+# 7. Commit
+git add passes/GenericFusionPass.cpp
+git commit -m "Fix fusion pattern for [case]"
+
+# 8. Push and create PR
+git push origin fix/issue-123
+```
+
+### Debugging Workflow
+
+See the [Debugging Guide](./debugging) for detailed techniques. Quick reference:
+
+```bash
+# 1. Enable verbose output
+stablehlo-opt -my-pass="verbose" input.mlir
+
+# 2. Dump IR at each stage
+stablehlo-opt input.mlir -my-pass -o stage1.mlir
+stablehlo-opt stage1.mlir -next-pass -o stage2.mlir
+
+# 3. Use debug builds
+cmake -DCMAKE_BUILD_TYPE=Debug ...
+lldb -- stablehlo-opt input.mlir -my-pass
+
+# 4. Check verification
+mlir-opt --verify-each stage1.mlir
+```
+
+## Testing Standards
+
+### Unit Test Coverage
+
+Every pass should have tests covering:
+
+1. **Basic functionality**: Simple positive case
+2. **Edge cases**: Empty inputs, single elements, etc.
+3. **Negative cases**: Pattern shouldn't match
+4. **Composition**: Interaction with other passes
+
+### Benchmark Requirements
+
+For performance-critical passes:
+
+1. **Baseline**: Measure before optimization
+2. **Improvement**: Show speedup on real workloads
+3. **Regression**: Verify no slowdown on other cases
+
+Example from `tools/benchmark_stage5.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+MLIR_CPU_RUNNER="third_party/stablehlo/llvm-project/build/bin/mlir-cpu-runner"
+RUNNER_UTILS="$(brew --prefix llvm@17)/lib/libmlir_runner_utils.dylib"
+
+echo "Benchmarking vectorized IR..."
+time "${MLIR_CPU_RUNNER}" \
+  ir/attn_stage5_vectorized.mlir \
+  -e main \
+  -entry-point-result=void \
+  -shared-libs="${RUNNER_UTILS}"
+```
+
+## Commit Message Guidelines
+
+### Format
+
+```
+<type>: <summary>
+
+<body>
+
+<footer>
+```
+
+### Types
+
+- `feat`: New feature (new pass, major enhancement)
+- `fix`: Bug fix
+- `perf`: Performance improvement
+- `refactor`: Code restructuring (no behavior change)
+- `test`: Add or update tests
+- `docs`: Documentation changes
+- `build`: Build system changes
+- `ci`: CI/CD changes
+
+### Examples
+
+From the repository history:
+
+```
+feat: Add GenericFusionPass for elementwise epilogue fusion
+
+- Implements producer-consumer fusion for linalg.generic
+- Only fuses when indexing maps are identical (safety)
+- Includes recursion guard and bounds checking
+- Improves attention pipeline by 12% on M1
+
+Closes #45
+```
+
+```
+fix: Prevent crash in GenericFusionPass on accumulator usage
+
+- Check if producer output block args are used before fusion
+- Abort fusion if accumulator is referenced in body
+- Adds validation in GenericFusionPass.cpp:145-152
+
+Fixes #67
+```
+
+```
+perf: Optimize ToyVectorizationPass vector dim selection
+
+- Choose innermost parallel loop for vectorization
+- Skip scalar loops (trip count == 1)
+- Improves matmul vectorization by 8%
+```
+
+## Maintainer Responsibilities
+
+### Code Review Checklist
+
+- [ ] Design is sound and fits project goals
+- [ ] Code follows LLVM style
+- [ ] All functions are documented
+- [ ] Tests cover new functionality
+- [ ] No performance regressions
+- [ ] Pass builds without warnings
+- [ ] Verifier passes on test cases
+- [ ] PR description is complete
+
+### Release Process
+
+1. **Version tagging**: Semantic versioning (`v0.1.0`)
+2. **Changelog**: Update with notable changes
+3. **Testing**: Full test suite passes
+4. **Documentation**: Sync with code changes
+
+## Community Guidelines
+
+### Code of Conduct
+
+- Be respectful and professional
+- Focus on technical merit of ideas
+- Welcome newcomers and help them learn
+- Provide constructive feedback
+
+### Communication Channels
+
+- **GitHub Issues**: Bug reports, feature requests
+- **GitHub Discussions**: General questions, ideas
+- **Pull Requests**: Code review and discussion
+
+## Resources
+
+### MLIR Documentation
+
+- [MLIR Language Reference](https://mlir.llvm.org/docs/LangRef/)
+- [MLIR Pass Infrastructure](https://mlir.llvm.org/docs/PassManagement/)
+- [Pattern Rewriting](https://mlir.llvm.org/docs/PatternRewriter/)
+- [LLVM Coding Standards](https://llvm.org/docs/CodingStandards.html)
+
+### microMLC Documentation
+
+- [Creating Custom Passes](./custom-passes)
+- [Debugging Guide](./debugging)
+- [Architecture Overview](../architecture/overview)
+- [Pipeline Design](../architecture/pipeline)
+
+### Example Passes
+
+Study these for reference:
+
+| Pass | Complexity | Learn From |
+|------|-----------|------------|
+| `FixUnrealizedIndexCastsPass.cpp` | Simple | Basic pattern structure |
+| `TilingPass.cpp` | Medium | Loop generation, recursion guards |
+| `GenericFusionPass.cpp` | Medium | Region merging, safety checks |
+| `ToyVectorizationPass.cpp` | Complex | Options, multi-stage pipeline, walkers |
+
+## Getting Help
+
+If you're stuck:
+
+1. **Read the docs**: Check guides and API references
+2. **Search issues**: Someone may have hit the same problem
+3. **Ask in discussions**: Post questions in GitHub Discussions
+4. **Open an issue**: If you found a bug, report it
+
+## License
+
+microMLC is licensed under the Apache 2.0 License. By contributing, you agree to license your contributions under the same terms.
+
+## Acknowledgments
+
+Contributions to microMLC help advance MLIR compiler research and education. Thank you for your interest in the project!

@@ -1,0 +1,353 @@
+---
+title: Running Individual Passes
+description: Learn how to run stablehlo-opt with custom transformation passes manually
+---
+
+## Overview
+
+The microMLC pipeline consists of multiple transformation passes that progressively lower and optimize MLIR code. While the automated pipeline script runs all stages sequentially, you can execute individual passes manually for debugging, experimentation, or custom workflows.
+
+## Prerequisites
+
+<Check>
+  Ensure `stablehlo-opt` is built at `third_party/stablehlo/build/bin/stablehlo-opt`
+</Check>
+
+<Check>
+  Have input MLIR files in the `ir/` directory
+</Check>
+
+## Basic Pass Execution
+
+The general syntax for running passes is:
+
+```bash
+stablehlo-opt <input.mlir> -pass-name -other-passes -o <output.mlir>
+```
+
+### Chaining Multiple Passes
+
+Passes are executed in the order specified on the command line:
+
+```bash
+stablehlo-opt input.mlir \
+  -stablehlo-tiling \
+  -canonicalize \
+  -cse \
+  -o output.mlir
+```
+
+## Pipeline Stages
+
+### Stage 0: Initial Cleanup
+
+Convert StableHLO to Linalg dialect and apply initial optimizations:
+
+```bash
+stablehlo-opt \
+  -stablehlo-tiling \
+  -canonicalize -cse \
+  ir/attn_complete.mlir -o ir/attn_stage0_linalg.mlir
+```
+
+**What it does:**
+- Converts StableHLO operations to Linalg generic operations
+- Removes redundant operations (canonicalize)
+- Eliminates common subexpressions (CSE)
+
+**Expected output:** Linalg generic ops with affine maps, named matmul operations preserved
+
+### Stage 1: Epilogue Fusion
+
+Fuse element-wise operations with their producers:
+
+```bash
+stablehlo-opt \
+  -generic-fusion \
+  -canonicalize -cse \
+  ir/attn_stage0_linalg.mlir -o ir/attn_stage1_fused.mlir
+```
+
+**What it does:**
+- Fuses element-wise epilogues (scaling, activation functions) into matmul operations
+- Keeps named matmuls intact for readability
+- Reduces intermediate tensor allocations
+
+**Expected output:** Fewer linalg.generic operations, fused computation bodies
+
+### Stage 2: Tensor Tiling
+
+Tile operations on tensor operands with hierarchical cache sizes:
+
+```bash
+stablehlo-opt \
+  "-stablehlo-linalg-tiling=l2-tile-sizes=64,64,64 l1-tile-sizes=4,4,4 enable-promotion=false" \
+  -canonicalize -cse \
+  ir/attn_stage1_fused.mlir -o ir/attn_stage2_tiled_tensor.mlir
+```
+
+**Parameters:**
+- `l2-tile-sizes=64,64,64` - L2 cache tile sizes for the three dimensions
+- `l1-tile-sizes=4,4,4` - L1 cache/vector register tile sizes
+- `enable-promotion=false` - Disable explicit buffer promotion (done later)
+
+**What it does:**
+- Introduces nested `scf.for` loops for tiled iteration
+- Creates tensor extract_slice/insert_slice operations
+- Optimizes for cache locality
+
+**Expected output:** Nested loops with small tile computations, still in tensor form
+
+<Note>
+  Tile sizes should be tuned based on your target architecture's cache hierarchy. L2 tiles of 64 work well for typical CPUs, while L1 tiles of 4 align with vector widths.
+</Note>
+
+### Stage 3: Bufferization
+
+Convert tensor operations to explicit memory buffers (memrefs):
+
+```bash
+stablehlo-opt \
+  -canonicalize -cse \
+  -empty-tensor-to-alloc-tensor \
+  "-one-shot-bufferize=bufferize-function-boundaries allow-return-allocs" \
+  -convert-bufferization-to-memref \
+  -canonicalize -cse \
+  ir/attn_stage2_tiled_tensor.mlir -o ir/attn_stage3_bufferized.mlir
+```
+
+**What it does:**
+- Converts `tensor.empty()` to `memref.alloc()`
+- Replaces tensor operations with in-place memref operations
+- Inserts `memref.dealloc` for memory management
+- Changes function signatures from tensors to memrefs with strided layouts
+
+**Expected output:** memref.alloc, memref.load, memref.store operations; no more tensors
+
+<Warning>
+  After bufferization, you must ensure proper memory deallocation. The one-shot-bufferize pass handles this automatically, but manual modifications may introduce leaks.
+</Warning>
+
+### Stage 5: Vectorization
+
+Convert scalar loops to vector operations:
+
+```bash
+stablehlo-opt \
+  "-toy-vectorize=vector-width=4 enable-reductions" \
+  -canonicalize -cse \
+  ir/attn_stage3_bufferized.mlir -o ir/attn_stage5_vectorized.mlir
+```
+
+**Parameters:**
+- `vector-width=4` - SIMD vector width (4 x f32 = 128-bit vectors)
+- `enable-reductions` - Allow vectorization of reduction operations
+
+**What it does:**
+- Converts innermost loops to `vector.transfer_read` and `vector.transfer_write`
+- Introduces vector arithmetic operations (`vector.fma`, `vector.mul`, etc.)
+- Generates vector reduction operations for sum/max
+
+**Expected output:** vector dialect operations, parallel SIMD execution
+
+<Note>
+  Stage 4 was removed in this pipeline. Vectorization now happens directly after bufferization.
+</Note>
+
+## Common Pass Combinations
+
+### Debugging Pass Ordering
+
+Run each pass individually and inspect intermediate outputs:
+
+```bash
+stablehlo-opt input.mlir -pass1 -o temp1.mlir
+stablehlo-opt temp1.mlir -pass2 -o temp2.mlir
+cat temp2.mlir  # Inspect intermediate result
+```
+
+### Always Canonicalize After Transformations
+
+Most transformation passes benefit from immediate cleanup:
+
+```bash
+stablehlo-opt input.mlir \
+  -your-transform-pass \
+  -canonicalize \
+  -cse \
+  -o output.mlir
+```
+
+## Standard MLIR Passes
+
+In addition to custom microMLC passes, you can use standard MLIR passes:
+
+### Canonicalize
+
+Applies local optimizations and simplifications:
+
+```bash
+stablehlo-opt input.mlir -canonicalize -o output.mlir
+```
+
+### Common Subexpression Elimination (CSE)
+
+Removes duplicate computations:
+
+```bash
+stablehlo-opt input.mlir -cse -o output.mlir
+```
+
+### Lower Affine
+
+Convert affine operations to standard loops:
+
+```bash
+stablehlo-opt input.mlir -lower-affine -o output.mlir
+```
+
+### Convert Linalg to Loops
+
+Lower Linalg operations to SCF loops:
+
+```bash
+stablehlo-opt input.mlir -convert-linalg-to-loops -o output.mlir
+```
+
+## Custom Passes
+
+### Fix Unrealized Index Casts
+
+Rewrite problematic conversion casts:
+
+```bash
+stablehlo-opt input.mlir -fix-unrealized-index-casts -o output.mlir
+```
+
+This pass converts `builtin.unrealized_conversion_cast` operations to proper `arith.index_cast` operations.
+
+### CF Integerize Index Block Args
+
+Convert control flow block arguments from `index` to `i64`:
+
+```bash
+stablehlo-opt input.mlir -cf-integerize-index-block-args -o output.mlir
+```
+
+Required before lowering to LLVM dialect on some platforms.
+
+## Verification and Debugging
+
+### Verify MLIR Correctness
+
+Add `-verify-diagnostics` to check for IR violations:
+
+```bash
+stablehlo-opt input.mlir -pass-name -verify-diagnostics
+```
+
+### Print Pass Pipeline
+
+See the complete pass pipeline being executed:
+
+```bash
+stablehlo-opt input.mlir -pass-pipeline='builtin.module(func.func(canonicalize))' \
+  -mlir-print-ir-after-all
+```
+
+### Dump Statistics
+
+Track operation counts and transformations:
+
+```bash
+stablehlo-opt input.mlir -pass-name -mlir-pass-statistics
+```
+
+## Working with Pass Options
+
+Passes with options use the syntax: `-pass-name=option1=value1 option2=value2`
+
+### Example: Tiling with Custom Sizes
+
+```bash
+stablehlo-opt input.mlir \
+  "-stablehlo-linalg-tiling=l2-tile-sizes=128,128,128 l1-tile-sizes=8,8,8" \
+  -o output.mlir
+```
+
+### Example: Vectorization with Custom Width
+
+```bash
+stablehlo-opt input.mlir \
+  "-toy-vectorize=vector-width=8 enable-reductions=true conservative=false" \
+  -o output.mlir
+```
+
+<Warning>
+  Option strings with spaces must be quoted. Use double quotes around the entire pass specification.
+</Warning>
+
+## Troubleshooting
+
+### Pass Not Found
+
+If you see `unknown pass 'pass-name'`:
+
+<Steps>
+  <Step title="Check pass registration">
+    Ensure the pass is registered in your build of stablehlo-opt:
+    ```bash
+    stablehlo-opt --help | grep pass-name
+    ```
+  </Step>
+  
+  <Step title="Verify custom passes are built">
+    Custom microMLC passes must be linked into the stablehlo-opt binary:
+    ```bash
+    make stablehlo-opt
+    ```
+  </Step>
+  
+  <Step title="Use correct dialect prefix">
+    Some passes require explicit dialect prefixes:
+    ```bash
+    -stablehlo-tiling  # Correct
+    -tiling            # May not work
+    ```
+  </Step>
+</Steps>
+
+### Type Conversion Errors
+
+If you see `unable to convert type` errors:
+
+1. **Check dialect dependencies** - Some passes require specific dialects to be loaded
+2. **Run conversion passes first** - Convert to target type system before transformations
+3. **Use reconcile-unrealized-casts** - Clean up leftover cast operations:
+
+```bash
+stablehlo-opt input.mlir \
+  -convert-pass \
+  -reconcile-unrealized-casts \
+  -o output.mlir
+```
+
+### Verification Failures
+
+If passes produce invalid IR:
+
+1. **Check input validity** - Verify the input is valid MLIR
+2. **Isolate the failing pass** - Run passes one at a time
+3. **Report bugs** - If a pass produces invalid IR, this is a compiler bug
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Pipeline Execution" icon="pipe" href="/usage/pipeline-execution">
+    Learn how to run the complete automated pipeline
+  </Card>
+  
+  <Card title="Benchmarking" icon="chart-line" href="/usage/benchmarking">
+    Measure performance of transformed code
+  </Card>
+</CardGroup>

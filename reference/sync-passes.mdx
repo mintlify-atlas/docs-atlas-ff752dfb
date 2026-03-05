@@ -1,0 +1,146 @@
+---
+title: sync_passes.sh
+description: Synchronize custom compiler passes into the StableHLO build tree
+---
+
+## Overview
+
+The `sync_passes.sh` script automates the process of copying custom MLIR compiler passes from the project's `passes/` directory into the StableHLO build tree. This ensures that microMLC's custom transformations are available when building the optimized compiler toolchain.
+
+## Location
+
+```
+tools/sync_passes.sh
+```
+
+## Purpose
+
+microMLC implements several custom MLIR passes for attention optimization and memory management. Rather than maintaining these passes within the vendored StableHLO codebase, they are developed in the project's `passes/` directory and synchronized into the build tree using this script.
+
+## Script Source
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}").." && pwd)"
+SRC_DIR="${ROOT}/passes"
+DST_DIR="${ROOT}/third_party/stablehlo/stablehlo/transforms"
+
+FILES=(
+  CMakeLists.txt
+  Passes.h
+  Passes.td
+  CfIntegerizeIndexBlockArgsPass.cpp
+  FixUnrealizedIndexCastsPass.cpp
+  GenericFusionPass.cpp
+  LinalgTilingPass.cpp
+  OneShotBufferizePass.cpp
+  ParallelSchedulingPassAttn.cpp
+  TilingPass.cpp
+  TilingPass.h
+  ToyVectorizationPass.cpp
+  ToyVectorizationPass.h
+)
+
+[[ -d "${SRC_DIR}" ]] || { echo "Missing passes dir: ${SRC_DIR}" >&2; exit 1; }
+[[ -d "${DST_DIR}" ]] || { echo "Missing stablehlo transforms dir: ${DST_DIR}" >&2; exit 1; }
+
+for f in "${FILES[@]}"; do
+  src="${SRC_DIR}/${f}"
+  [[ -f "${src}" ]] || { echo "Missing ${src}" >&2; exit 1; }
+  cp -f "${src}" "${DST_DIR}/"
+done
+
+echo "Synced passes into ${DST_DIR}"
+```
+
+## How It Works
+
+### Directory Structure
+
+- **Source**: `passes/` - Contains all custom pass implementations
+- **Destination**: `third_party/stablehlo/stablehlo/transforms/` - StableHLO's transformation directory
+
+### Synchronized Files
+
+The script syncs 12 files, organized into three categories:
+
+#### Build Configuration
+- `CMakeLists.txt` - Build system integration
+- `Passes.h` - Pass declarations and registration
+- `Passes.td` - TableGen definitions for pass options
+
+#### Core Optimization Passes
+- `GenericFusionPass.cpp` - Fuses elementwise epilogues into producers
+- `LinalgTilingPass.cpp` - Multi-level tiling for cache hierarchy
+- `TilingPass.cpp` / `TilingPass.h` - Alternative tiling implementation
+- `OneShotBufferizePass.cpp` - Tensor-to-memref conversion
+- `ToyVectorizationPass.cpp` / `ToyVectorizationPass.h` - SIMD vectorization
+
+#### Support Passes
+- `CfIntegerizeIndexBlockArgsPass.cpp` - Converts index types in control flow
+- `FixUnrealizedIndexCastsPass.cpp` - Canonicalizes type casts
+- `ParallelSchedulingPassAttn.cpp` - Parallelization for attention kernels
+
+### Safety Checks
+
+The script performs validation before copying:
+
+1. **Source directory exists**: Verifies `passes/` is present
+2. **Destination directory exists**: Ensures StableHLO is properly vendored
+3. **All files exist**: Checks each source file before copying
+4. **Fail-fast**: Exits immediately on any error (`set -euo pipefail`)
+
+## Usage
+
+### Basic Execution
+
+```bash
+./tools/sync_passes.sh
+```
+
+### Expected Output
+
+```
+Synced passes into /path/to/project/third_party/stablehlo/stablehlo/transforms
+```
+
+### When to Run
+
+Run this script:
+
+- After modifying any pass in `passes/`
+- Before rebuilding the compiler toolchain
+- After pulling changes that update pass implementations
+- When setting up the project for the first time
+
+## Integration with Build System
+
+After syncing, rebuild StableHLO to compile the passes:
+
+```bash
+cd third_party/stablehlo
+cmake --build build
+```
+
+The passes will then be available in `stablehlo-opt`:
+
+```bash
+./third_party/stablehlo/build/bin/stablehlo-opt --help | grep -E "(generic-fusion|toy-vectorize)"
+```
+
+## Error Handling
+
+Common errors and solutions:
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `Missing passes dir` | Source directory not found | Ensure you're in the project root |
+| `Missing stablehlo transforms dir` | StableHLO not initialized | Run `git submodule update --init` |
+| `Missing <file>` | Pass file deleted/renamed | Check git status in `passes/` |
+
+## Related
+
+- [Pipeline Script](./pipeline-script) - Uses these passes in the compilation pipeline
+- [Benchmark Scripts](./benchmark-scripts) - Measures pass effectiveness
