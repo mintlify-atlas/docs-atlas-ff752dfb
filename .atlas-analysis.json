@@ -1,0 +1,111 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "microMLC",
+  "projectDescription": "A playground for exploring MLIR/StableHLO compiler passes on transformer workloads with focus on tiling, fusion, bufferization, and vectorization optimizations.",
+  "theme": "aspen",
+  "primaryColor": "#0066CC",
+  "lightColor": "#3399FF",
+  "darkColor": "#004499",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Setup",
+            "pages": [
+              "setup/installation",
+              "setup/dependencies",
+              "setup/building"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/pipeline",
+              "architecture/ir-stages"
+            ]
+          },
+          {
+            "group": "Compiler Passes",
+            "pages": [
+              "passes/overview",
+              "passes/tiling",
+              "passes/fusion",
+              "passes/linalg-tiling",
+              "passes/bufferization",
+              "passes/vectorization",
+              "passes/parallel-scheduling"
+            ]
+          },
+          {
+            "group": "Usage",
+            "pages": [
+              "usage/running-passes",
+              "usage/pipeline-execution",
+              "usage/benchmarking"
+            ]
+          },
+          {
+            "group": "Development",
+            "pages": [
+              "development/custom-passes",
+              "development/debugging",
+              "development/contributing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "Tools",
+            "pages": [
+              "reference/sync-passes",
+              "reference/benchmark-scripts",
+              "reference/pipeline-script"
+            ]
+          },
+          {
+            "group": "IR Examples",
+            "pages": [
+              "reference/ir-examples",
+              "reference/transformer-models"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Custom MLIR compiler passes for transformer optimization",
+    "Multi-level tiling (L2/L1 cache-aware)",
+    "Generic operation fusion for adjacent Linalg ops",
+    "One-shot tensor-to-memref bufferization",
+    "SIMD vectorization with configurable width",
+    "Parallel scheduling for attention operations",
+    "Complete pipeline from StableHLO to optimized MLIR",
+    "Benchmarking infrastructure with mlir-cpu-runner"
+  ],
+  "publicApiSurface": [
+    "stablehlo-tiling",
+    "generic-fusion",
+    "stablehlo-linalg-tiling",
+    "one-shot-bufferize",
+    "toy-vectorize",
+    "parallel-scheduling-attn",
+    "tools/sync_passes.sh",
+    "tools/run_attn_cache_pipeline.sh",
+    "tools/benchmark_all_stages.sh",
+    "tools/benchmark_stage5.sh"
+  ]
+}
